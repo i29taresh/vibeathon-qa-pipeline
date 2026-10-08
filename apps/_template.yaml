@@ -1,0 +1,60 @@
+# Template for a per-app configuration file.
+#
+# Copy this file to apps/<app_name>.yaml and fill in real values for the
+# target application. Every pipeline node reads its app-specific details
+# from this file - never hardcode a repo, flow path, or build command
+# in node logic.
+#
+# Only the `device.<platform>` and `build.<platform>` section matching the
+# top-level `platform` field is required. The other platform's section may
+# be omitted entirely.
+
+name: ""              # Application name, e.g. "my-shopping-app"
+platform: ""          # "android" or "ios"
+repo: ""              # GitHub "owner/repository"
+clone_path: ""        # Local source checkout dir, relative to the project root.
+                       # MUST resolve outside this orchestrator repo (e.g. "../workspace/<app>") -
+                       # real mode refuses to run otherwise (graph.ensure_source_isolated).
+flows_dir: ""         # Maestro test-flow directory, relative to the project root
+reference_dir: ""     # Expected/reference UI screenshots dir, relative to the project root
+
+# Optional. Flow filenames (relative to flows_dir) retest_agent re-runs as a
+# regression suite after a fix, in addition to the originally failing flow.
+# Leave empty if there's nothing to configure yet.
+regression_flows: []  # e.g. ["smoke_test.yaml", "checkout_flow.yaml"]
+
+device:
+  # Android emulator configuration. Required when platform: android.
+  android:
+    avd_name: ""       # Name of the AVD/emulator to boot, e.g. "pixel_7_api_34"
+    api_level: 0        # Emulator API level, e.g. 34
+
+  # iOS simulator configuration. Required when platform: ios.
+  ios:
+    simulator_name: ""  # e.g. "iPhone 15"
+    os_version: ""       # e.g. "17.5"
+
+build:
+  # Android build configuration. Required when platform: android.
+  # Supports Java, Kotlin, XML, and Jetpack Compose apps - these are all
+  # just different source languages inside the same Gradle module, so the
+  # config only needs to know the module and the resulting artifact.
+  android:
+    module: ""              # Gradle module containing the app, e.g. ":app"
+    build_command: ""       # e.g. "./gradlew :app:assembleDebug"
+    artifact_path: ""       # Built APK path, relative to clone_path
+    install_command: ""     # e.g. "adb install -r {artifact_path}"
+    package_id: ""          # Application/package ID used to launch the app
+    test_command: ""        # Optional. Unit/regression test command, e.g. "./gradlew :app:testDebugUnitTest"
+
+  # iOS build configuration. Required when platform: ios.
+  # Supports Swift/SwiftUI and UIKit apps, and either an .xcodeproj or an
+  # .xcworkspace - the config only needs the scheme and workspace/project path.
+  ios:
+    scheme: ""               # Xcode scheme to build
+    workspace: ""             # .xcworkspace or .xcodeproj path, relative to clone_path
+    build_command: ""         # e.g. "xcodebuild -workspace App.xcworkspace -scheme App -configuration Debug"
+    artifact_path: ""          # Built .app bundle path, relative to clone_path
+    install_command: ""        # e.g. "xcrun simctl install booted {artifact_path}"
+    bundle_id: ""               # Bundle identifier used to launch the app
+    test_command: ""            # Optional. Unit/regression test command, e.g. "xcodebuild test -workspace App.xcworkspace -scheme App -destination 'platform=iOS Simulator,name=iPhone 15'"

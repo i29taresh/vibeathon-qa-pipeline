@@ -1,0 +1,25 @@
+# Dummy Android app config used for development and tests.
+# Values are placeholders - this app is not actually cloned or built.
+
+name: "sample-android-app"
+platform: "android"
+repo: "your-org/sample-android-app"
+# "../" keeps the checkout outside this orchestrator repo - required by
+# graph.ensure_source_isolated (real mode refuses to run otherwise).
+clone_path: "../workspace/sample-android-app"
+flows_dir: "flows/sample-android-app"
+reference_dir: "references/sample-android-app"
+
+device:
+  android:
+    avd_name: "pixel_7_api_34"
+    api_level: 34
+
+build:
+  android:
+    module: ":app"
+    build_command: "./gradlew :app:assembleDebug"
+    artifact_path: "app/build/outputs/apk/debug/app-debug.apk"
+    install_command: "adb install -r {artifact_path}"
+    package_id: "com.example.sampleandroidapp"
+    test_command: "./gradlew :app:testDebugUnitTest"

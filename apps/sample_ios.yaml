@@ -1,0 +1,26 @@
+# Dummy iOS app config used for development and tests.
+# Values are placeholders - this app is not actually cloned or built.
+
+name: "sample-ios-app"
+platform: "ios"
+repo: "your-org/sample-ios-app"
+# "../" keeps the checkout outside this orchestrator repo - required by
+# graph.ensure_source_isolated (real mode refuses to run otherwise).
+clone_path: "../workspace/sample-ios-app"
+flows_dir: "flows/sample-ios-app"
+reference_dir: "references/sample-ios-app"
+
+device:
+  ios:
+    simulator_name: "iPhone 15"
+    os_version: "17.5"
+
+build:
+  ios:
+    scheme: "SampleIOSApp"
+    workspace: "SampleIOSApp.xcworkspace"
+    build_command: "xcodebuild -workspace SampleIOSApp.xcworkspace -scheme SampleIOSApp -configuration Debug -sdk iphonesimulator"
+    artifact_path: "build/Debug-iphonesimulator/SampleIOSApp.app"
+    install_command: "xcrun simctl install booted {artifact_path}"
+    bundle_id: "com.example.sampleiosapp"
+    test_command: "xcodebuild test -workspace SampleIOSApp.xcworkspace -scheme SampleIOSApp -destination 'platform=iOS Simulator,name=iPhone 15'"
