@@ -9,6 +9,7 @@ a filesystem path), so they're resolved and checked before use.
 
 from __future__ import annotations
 
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,8 +31,12 @@ class MaestroResult:
     run_dir: Path | None = None
     report_path: Path | None = None
     screenshots: list[Path] = field(default_factory=list)
+    videos: list[Path] = field(default_factory=list)
     logs: str = ""
     error: str | None = None
+
+
+_VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 
 
 def run_flow(
@@ -40,6 +45,7 @@ def run_flow(
     device_id: str,
     runs_root: Path | None = None,
     timeout: float = 600.0,
+    record_screen: bool = False,
 ) -> MaestroResult:
     """Execute `flows_dir/<flow_name>` on `device_id` via the Maestro CLI."""
     try:
@@ -66,12 +72,21 @@ def run_flow(
         "--debug-output", str(run_dir),
     ]
 
+    should_record = record_screen or os.environ.get("QA_RECORD_SCREEN") == "1"
+    recording = _start_recording(app_config, device_id, run_dir) if should_record else None
+    command_error: str | None = None
     try:
         result = run_command(argv, cwd=app_config.clone_path, timeout=timeout)
     except RunnerError as exc:
-        return MaestroResult(success=False, run_dir=run_dir, error=str(exc))
+        result = None
+        command_error = str(exc)
+    _stop_recording(recording)
 
     screenshots = sorted(run_dir.glob("*.png"))
+    videos = _collect_videos(run_dir)
+    if command_error is not None or result is None:
+        return MaestroResult(success=False, run_dir=run_dir, screenshots=screenshots, videos=videos, error=command_error)
+
     logs = redact(result.stdout + result.stderr)
 
     if result.timed_out:
@@ -80,6 +95,7 @@ def run_flow(
             exit_code=result.returncode,
             run_dir=run_dir,
             screenshots=screenshots,
+            videos=videos,
             logs=logs,
             error=f"Maestro flow timed out after {timeout}s",
         )
@@ -90,9 +106,30 @@ def run_flow(
         run_dir=run_dir,
         report_path=report_path if report_path.is_file() else None,
         screenshots=screenshots,
+        videos=videos,
         logs=logs,
         error=None if result.ok else redact(result.stderr.strip() or f"maestro exited with {result.returncode}"),
     )
+
+
+def _collect_videos(run_dir: Path) -> list[Path]:
+    if not run_dir.is_dir():
+        return []
+    return sorted(path for path in run_dir.rglob("*") if path.is_file() and path.suffix.lower() in _VIDEO_SUFFIXES)
+
+
+def _start_recording(app_config: AppConfig, device_id: str, run_dir: Path):
+    from utils.platform import start_screen_recording
+
+    return start_screen_recording(app_config, device_id, run_dir / "screenrecord.mp4")
+
+
+def _stop_recording(recording) -> None:
+    if recording is None:
+        return
+    from utils.platform import stop_screen_recording
+
+    stop_screen_recording(recording)
 
 
 def _make_run_dir(app_config: AppConfig, flow_path: Path, runs_root: Path | None) -> Path:

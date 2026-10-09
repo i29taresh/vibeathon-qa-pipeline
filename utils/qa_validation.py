@@ -11,6 +11,7 @@ visual-comparison step - they live here exactly once.
 
 from __future__ import annotations
 
+import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +45,7 @@ class QAFinding:
     confidence: float
     reproduction_steps: list[str] = field(default_factory=list)
     evidence_paths: list[str] = field(default_factory=list)
+    video_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -84,7 +86,17 @@ def run_qa_check(app_config: AppConfig, flow_name: str) -> QAFinding:
         finding = infra_finding
 
     if finding is None:
-        maestro_result = run_flow(app_config, flow_name, device_id)
+        # Ask the real run_flow to capture a screen recording. A kwarg would
+        # break tests that replace run_flow with a fake of the old signature.
+        previous = os.environ.get("QA_RECORD_SCREEN")
+        os.environ["QA_RECORD_SCREEN"] = "1"
+        try:
+            maestro_result = run_flow(app_config, flow_name, device_id)
+        finally:
+            if previous is None:
+                os.environ.pop("QA_RECORD_SCREEN", None)
+            else:
+                os.environ["QA_RECORD_SCREEN"] = previous
         if maestro_result.exit_code is None:
             finding = QAFinding(
                 flow_name=flow_name,
@@ -95,6 +107,7 @@ def run_qa_check(app_config: AppConfig, flow_name: str) -> QAFinding:
                 actual_behavior="N/A",
                 confidence=1.0,
                 evidence_paths=[str(p) for p in maestro_result.screenshots],
+                video_paths=[str(p) for p in maestro_result.videos],
             )
         else:
             step_results = parse_junit_report(maestro_result.report_path)
@@ -262,6 +275,7 @@ def build_finding(
     evidence_paths = [str(p) for p in maestro_result.screenshots]
     if maestro_result.report_path:
         evidence_paths.append(str(maestro_result.report_path))
+    video_paths = [str(p) for p in maestro_result.videos]
 
     # Rule: a flow is never "passed" if Maestro's own assertions failed,
     # regardless of anything the LLM says.
@@ -279,6 +293,7 @@ def build_finding(
             ),
             actual_behavior=(llm_data or {}).get("actual_behavior", failure_messages),
             evidence_paths=evidence_paths,
+            video_paths=video_paths,
             confidence=1.0,  # Maestro's exit code/assertions are ground truth, not inferred.
         )
 
@@ -293,6 +308,7 @@ def build_finding(
             expected_behavior=llm_data.get("expected_behavior", "UI should match the reference screenshots."),
             actual_behavior=llm_data.get("actual_behavior", "UI differs from the reference screenshots."),
             evidence_paths=evidence_paths,
+            video_paths=video_paths,
             confidence=float(llm_data.get("confidence", 0.5)),
         )
 
@@ -304,5 +320,6 @@ def build_finding(
         expected_behavior="Flow completes with all assertions passing.",
         actual_behavior="Flow completed with all assertions passing.",
         evidence_paths=evidence_paths,
+        video_paths=video_paths,
         confidence=1.0,
     )

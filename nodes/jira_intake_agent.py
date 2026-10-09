@@ -106,5 +106,6 @@ def _run_real(state: PipelineState) -> dict:
         "jira_baseline": result.jira_baseline,
         "qa_finding": finding,
         "screenshots": [p for p in finding.get("evidence_paths") or [] if p.lower().endswith(".png")],
+        "before_video_paths": list(finding.get("video_paths") or []),
         "execution_history": [history],
     }

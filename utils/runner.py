@@ -18,6 +18,8 @@ safety.
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,3 +93,50 @@ def run_command(
         stdout=completed.stdout,
         stderr=completed.stderr,
     )
+
+
+def start_background(argv: Sequence[str], cwd: Path) -> subprocess.Popen:
+    """Start a trusted command and return without waiting for it to exit.
+
+    The process is its own session so the caller can signal the whole group
+    (needed for `adb shell screenrecord` and `simctl io recordVideo`, which
+    only finalize their file after SIGINT).
+    """
+    if isinstance(argv, (str, bytes)):
+        raise RunnerError("argv must be a list of strings, not a single shell string")
+    argv = list(argv)
+    if not argv:
+        raise RunnerError("argv must not be empty")
+    cwd = Path(cwd)
+    if not cwd.is_dir():
+        raise RunnerError(f"Working directory does not exist: {cwd}")
+    try:
+        return subprocess.Popen(
+            argv,
+            cwd=cwd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise RunnerError(f"Command not found: {argv[0]}") from exc
+
+
+def stop_background(proc: subprocess.Popen, timeout: float = 8.0) -> None:
+    """SIGINT a background command so it can flush its output, then wait."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGINT)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        proc.wait(timeout=3)

@@ -25,7 +25,7 @@ from typing import Any
 
 from config import AppConfig
 from utils.paths import PathSecurityError, ensure_within
-from utils.runner import RunnerError, run_command
+from utils.runner import RunnerError, run_command, start_background, stop_background
 from utils.secrets import redact
 
 
@@ -227,3 +227,66 @@ def install_app(app_config: AppConfig, device_id: str, artifact_path: Path, time
         return PlatformResult(success=False, error=str(exc))
 
     return _result_from_command(result, artifact_path=artifact_path if result.ok else None)
+
+
+# --------------------------------------------------------------------------
+# Screen recording (best-effort; a failure here never fails the QA run)
+# --------------------------------------------------------------------------
+
+@dataclass
+class ScreenRecording:
+    """A screen recording started on a device and not yet pulled locally."""
+
+    process: Any
+    dest: Path
+    platform: str
+    device_id: str
+    cwd: Path
+    remote_path: str | None = None
+
+
+def start_screen_recording(app_config: AppConfig, device_id: str, dest: Path) -> ScreenRecording | None:
+    """Begin a device screen recording into `dest`. Returns None if it cannot start."""
+    cwd = app_config.clone_path if app_config.clone_path.is_dir() else Path.cwd()
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if app_config.platform == "android":
+            remote = f"/sdcard/ox-{dest.stem}.mp4"
+            process = start_background(
+                ["adb", "-s", device_id, "shell", "screenrecord", "--time-limit", "180", remote],
+                cwd,
+            )
+            return ScreenRecording(
+                process=process, dest=dest, platform="android", device_id=device_id, cwd=cwd, remote_path=remote
+            )
+        process = start_background(
+            ["xcrun", "simctl", "io", device_id, "recordVideo", "--codec", "h264", str(dest)],
+            cwd,
+        )
+        return ScreenRecording(process=process, dest=dest, platform="ios", device_id=device_id, cwd=cwd)
+    except (OSError, RunnerError):
+        return None
+
+
+def stop_screen_recording(recording: ScreenRecording | None) -> Path | None:
+    """Stop a recording and return the local file when it has actual bytes."""
+    if recording is None:
+        return None
+    stop_background(recording.process)
+    if recording.platform == "android" and recording.remote_path:
+        try:
+            run_command(
+                ["adb", "-s", recording.device_id, "pull", recording.remote_path, str(recording.dest)],
+                cwd=recording.cwd,
+                timeout=60.0,
+            )
+            run_command(
+                ["adb", "-s", recording.device_id, "shell", "rm", "-f", recording.remote_path],
+                cwd=recording.cwd,
+                timeout=15.0,
+            )
+        except RunnerError:
+            return None
+    if recording.dest.is_file() and recording.dest.stat().st_size > 0:
+        return recording.dest
+    return None

@@ -29,6 +29,7 @@ def test_run_flow_success(monkeypatch, tmp_path):
     def fake_run_command(argv, cwd, timeout=120.0, env=None):
         run_dir = Path(argv[argv.index("--debug-output") + 1])
         (run_dir / "step1.png").write_bytes(b"fake-png")
+        (run_dir / "screenrecord.mp4").write_bytes(b"fake-mp4")
         report_path = Path(argv[argv.index("--output") + 1])
         report_path.write_text("<testsuite/>")
         return CommandResult(argv=argv, returncode=0, stdout="PASSED", stderr="")
@@ -41,6 +42,8 @@ def test_run_flow_success(monkeypatch, tmp_path):
     assert result.exit_code == 0
     assert result.report_path.is_file()
     assert len(result.screenshots) == 1
+    assert len(result.videos) == 1
+    assert result.videos[0].name == "screenrecord.mp4"
     assert result.run_dir.exists()
 
 

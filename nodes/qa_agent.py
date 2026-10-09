@@ -79,5 +79,6 @@ def _run_real(state: PipelineState) -> dict:
         "last_error": None if finding.passed else finding.description,
         "screenshots": finding.evidence_paths,
         "qa_finding": asdict(finding),
+        "before_video_paths": list(finding.video_paths),
         "execution_history": [history],
     }

@@ -1,8 +1,9 @@
 # Run with:  streamlit run dashboard.py
-"""Streamlit ops dashboard for the vibeathon QA pipeline (MeinMagenta theme)."""
+"""Streamlit ops dashboard for the vibeathon QA pipeline (Cyberpunk Developer theme)."""
 
 from __future__ import annotations
 
+import html
 import os
 import queue
 import threading
@@ -32,15 +33,19 @@ from utils import jira as jira_api
 
 ROOT = Path(__file__).resolve().parent
 
-ACCENT = "#E20074"
-CANVAS = "#0E1117"
-NEUTRAL = "#999B9E"
-CARD = "#1a1f2a"
-SIDEBAR = "#141820"
-WHITE = "#FFFFFF"
-SUCCESS = "#28A745"
-WARNING = "#FFC107"
-ERROR = "#DC3545"
+ACCENT = "#FF2A6D"
+CYAN = "#05D9E8"
+CANVAS = "#090A0F"
+NEUTRAL = "#8B93A7"
+BORDER = "#1E222B"
+CARD = "#13151A"
+INPUT_BG = "#1A1D26"
+INPUT_BORDER = "#2A2E3D"
+SIDEBAR = "#13151A"
+WHITE = "#E5E9F0"
+SUCCESS = "#39FF88"
+WARNING = "#FFC857"
+ERROR = "#FF4D5E"
 
 PIPELINE_STEPS = ["qa_agent", "rca_agent", "ticket_agent", "dev_agent", "retest_agent", "merge_step"]
 FLOW_SUFFIXES = (".yaml", ".yml")
@@ -69,6 +74,76 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes}m {rem}s"
 
 
+_ERR_MARKERS = ("failed", "error", "needs_human_review", "crash", "timeout")
+_WARN_MARKERS = ("blocked", "skipped", "requires_approval", "no_changes", "dry_run", "unverified", "bug_detected")
+_OK_MARKERS = (
+    "passed", "success", "created", "updated", "fixed", "applied", "ready", "no_bugs", "complete", "done", "connected"
+)
+
+
+def _status_tone(status: str | None) -> str:
+    s = (status or "").lower()
+    if not s or s == "pending":
+        return "idle"
+    if "progress" in s or "running" in s:
+        return "run"
+    if any(m in s for m in _ERR_MARKERS):
+        return "err"
+    if any(m in s for m in _WARN_MARKERS):
+        return "warn"
+    if any(m in s for m in _OK_MARKERS):
+        return "ok"
+    return "info"
+
+
+def _pill(status: str | None, tone: str | None = None) -> str:
+    label = html.escape(str(status or "pending"))
+    return f"<span class='ox-pill {tone or _status_tone(status)}'>{label}</span>"
+
+
+def _section(title: str, subtitle: str = "") -> None:
+    sub = f" <small>{html.escape(subtitle)}</small>" if subtitle else ""
+    st.markdown(f"<div class='ox-section-title'>{html.escape(title)}{sub}</div>", unsafe_allow_html=True)
+
+
+def _stats_html(items: list[tuple[str, str]]) -> str:
+    cells = "".join(
+        f"<div class='ox-stat'><div class='k'>{html.escape(k)}</div><div class='v'>{v}</div></div>" for k, v in items
+    )
+    return f"<div class='ox-stats'>{cells}</div>"
+
+
+def _history_table_html(history: list[dict], active: str | None = None, attempt: int | str = "") -> str:
+    rows = []
+    for rec in history:
+        detail = str(rec.get("detail") or "—")
+        if len(detail) > 220:
+            detail = detail[:217] + "..."
+        rows.append(
+            "<tr>"
+            f"<td class='ox-node'>{html.escape(str(rec.get('node', '?')))}</td>"
+            f"<td>{_pill(rec.get('status'))}</td>"
+            f"<td class='ox-num'>{html.escape(str(rec.get('attempt_count', '')))}</td>"
+            f"<td class='ox-detail'>{html.escape(detail)}</td>"
+            "</tr>"
+        )
+    if active and active not in {r.get("node") for r in history}:
+        rows.append(
+            "<tr>"
+            f"<td class='ox-node'>{html.escape(active)}</td>"
+            f"<td>{_pill('in progress', 'run')}</td>"
+            f"<td class='ox-num'>{html.escape(str(attempt))}</td>"
+            "<td class='ox-detail'>Waiting for this step to finish</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='4' class='ox-detail'>No steps recorded yet.</td></tr>")
+    return (
+        "<table class='ox-table'><thead><tr><th>Step</th><th>Status</th><th>Attempt</th><th>Detail</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
 def _guess_active_node(history: list[dict], jira_intake: bool, running: bool) -> str | None:
     if not running:
         return None
@@ -77,6 +152,35 @@ def _guess_active_node(history: list[dict], jira_intake: bool, running: bool) ->
         if node not in completed:
             return node
     return "finishing"
+
+
+def _progress_log(state: dict, elapsed_sec: float, running: bool) -> str:
+    history = state.get("execution_history") or []
+    jira_intake = bool(state.get("jira_issue_key") or state.get("jira_issue_input"))
+    active = _guess_active_node(history, jira_intake, running)
+    status = state.get("status") or "pending"
+    attempt = state.get("attempt_count", 0)
+    max_att = state.get("max_attempts", 3)
+    lines = [
+        f"elapsed {_format_elapsed(elapsed_sec)}    attempts {attempt}/{max_att}    status {status}",
+    ]
+    if running and active:
+        hint = " (may take several minutes)" if active in _LONG_RUNNING_NODES else ""
+        lines.append(f"running {active}{hint}")
+    lines.append("")
+    if not history and not (running and active):
+        lines.append("Waiting for the first agent to report…")
+    for rec in history:
+        detail = " ".join(str(rec.get("detail") or "").split())
+        lines.append(
+            f"[{rec.get('node', '?')}] {rec.get('status', '')}  attempt {rec.get('attempt_count', '')}"
+        )
+        if detail:
+            lines.append(f"    {detail}")
+    if running and active and active not in {r.get("node") for r in history}:
+        lines.append(f"[{active}] in progress  attempt {attempt}")
+        lines.append("    Waiting for this step to finish")
+    return "\n".join(lines)
 
 
 def _render_live_progress(
@@ -88,32 +192,12 @@ def _render_live_progress(
     history = state.get("execution_history") or []
     jira_intake = bool(state.get("jira_issue_key") or state.get("jira_issue_input"))
     active = _guess_active_node(history, jira_intake, running)
-    status = state.get("status") or "pending"
-    attempt = state.get("attempt_count", 0)
-    max_att = state.get("max_attempts", 3)
-
-    header = (
-        f"**Elapsed:** {_format_elapsed(elapsed_sec)} · "
-        f"**Attempts:** {attempt}/{max_att} · "
-        f"**Status:** `{status}`"
+    log = html.escape(_progress_log(state, elapsed_sec, running))
+    container.markdown(
+        f"<pre class='ox-log'>{log}</pre>"
+        + _history_table_html(history, active if running else None, state.get("attempt_count", "")),
+        unsafe_allow_html=True,
     )
-    if running and active:
-        hint = " (may take several minutes)" if active in _LONG_RUNNING_NODES else ""
-        header += f" · **Running:** `{active}`{hint}"
-
-    lines = ["| Step | Status | Attempt | Detail |", "| --- | --- | --- | --- |"]
-    for rec in history:
-        detail = (rec.get("detail") or "").replace("|", "\\|").replace("\n", " ")
-        if len(detail) > 120:
-            detail = detail[:117] + "..."
-        lines.append(
-            f"| `{rec.get('node', '?')}` | `{rec.get('status', '')}` | "
-            f"{rec.get('attempt_count', '')} | {detail or '—'} |"
-        )
-    if running and active and active not in {r.get("node") for r in history}:
-        lines.append(f"| `{active}` | *in progress…* | {attempt} | Waiting for this step to finish |")
-
-    container.markdown(header + "\n\n" + "\n".join(lines))
 
 
 def _run_pipeline_with_live_ui(state: dict) -> tuple[dict, float]:
@@ -136,25 +220,24 @@ def _run_pipeline_with_live_ui(state: dict) -> tuple[dict, float]:
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
-    status = st.status("Agent pipeline running…", expanded=True)
-    body = st.empty()
-    tick = 0.0
-    while thread.is_alive():
-        elapsed = time.monotonic() - started
-        _render_live_progress(latest["state"], max(elapsed, latest["elapsed"]), True, body)
-        status.update(label=f"Agent pipeline running… {_format_elapsed(elapsed)}")
-        time.sleep(0.4)
-        tick = elapsed
+    with st.status("Agent pipeline running…", expanded=True) as status:
+        body = st.empty()
+        _render_live_progress(latest["state"], 0.0, True, body)
+        while thread.is_alive():
+            elapsed = time.monotonic() - started
+            _render_live_progress(latest["state"], max(elapsed, latest["elapsed"]), True, body)
+            status.update(label=f"Agent pipeline running… {_format_elapsed(elapsed)}", expanded=True)
+            time.sleep(0.4)
 
-    kind, payload = result_queue.get()
-    if kind == "err":
-        status.update(label="Pipeline failed", state="error")
-        raise payload
+        kind, payload = result_queue.get()
+        if kind == "err":
+            status.update(label="Pipeline failed", state="error", expanded=True)
+            raise payload
 
-    final = payload
-    total = time.monotonic() - started
-    _render_live_progress(final, total, False, body)
-    status.update(label=f"Pipeline finished in {_format_elapsed(total)}", state="complete")
+        final = payload
+        total = time.monotonic() - started
+        _render_live_progress(final, total, False, body)
+        status.update(label=f"Pipeline finished in {_format_elapsed(total)}", state="complete", expanded=True)
     return final, total
 
 
@@ -178,42 +261,243 @@ SESSION_ENV_KEYS = [
 
 CSS = f"""
 <style>
-.stApp {{ background-color: {CANVAS}; color: {WHITE}; }}
-[data-testid="stSidebar"] {{ background-color: {SIDEBAR}; border-right: 1px solid {NEUTRAL}33; }}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+.stApp {{
+  background:
+    radial-gradient(1200px 600px at 100% -10%, {ACCENT}14, transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, {CYAN}10, transparent 60%),
+    {CANVAS};
+  color: {WHITE};
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}}
+.stApp p, .stApp label, .stApp li, .stApp input, .stApp textarea, .stApp button {{
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}}
+/* Keep Streamlit's ligature icons (sidebar toggle, deploy, alerts) as glyphs. */
+[data-testid="stIconMaterial"],
+.material-symbols-rounded,
+.material-symbols-outlined,
+.material-symbols-sharp {{
+  font-family: "Material Symbols Rounded" !important;
+  font-weight: normal !important;
+  font-style: normal !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+  line-height: 1 !important;
+  white-space: nowrap !important;
+}}
+.block-container {{ padding: 2rem 2.5rem 3rem 2.5rem; max-width: 1400px; }}
+h1, h2, h3, h4 {{ color: {WHITE}; letter-spacing: -0.5px; font-weight: 700; }}
+[data-testid="stWidgetLabel"] p {{
+  color: {NEUTRAL} !important; font-size: 0.78rem !important; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}}
+.ox-section-title {{
+  display: flex; align-items: center; gap: 10px; margin: 0 0 14px 0;
+  font-size: 0.95rem; font-weight: 700; color: {WHITE}; letter-spacing: -0.2px;
+}}
+.ox-section-title::before {{
+  content: ""; width: 4px; height: 18px; border-radius: 4px;
+  background: linear-gradient(180deg, {ACCENT}, {CYAN}); box-shadow: 0 0 10px {ACCENT}88;
+}}
+.ox-section-title small {{ color: {NEUTRAL}; font-weight: 500; font-size: 0.78rem; }}
+a {{ color: {CYAN} !important; }}
+
+[data-testid="stSidebar"] {{ background-color: {SIDEBAR}; border-right: 1px solid {BORDER}; }}
+[data-testid="stSidebar"] [role="radiogroup"] label {{
+  padding: 8px 12px; border-radius: 10px; margin-bottom: 4px; border: 1px solid transparent;
+  transition: all 0.15s ease;
+}}
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {{
+  border-color: {CYAN}55; background-color: {CYAN}0D;
+}}
+
 .mm-header-strip {{
-  background: linear-gradient(90deg, {ACCENT} 0%, #a0005a 100%);
-  color: {WHITE}; padding: 18px 24px; border-radius: 6px; margin-bottom: 16px;
+  position: relative; background: {CARD}; border: 1px solid {BORDER}; border-radius: 16px;
+  padding: 22px 28px; margin-bottom: 22px; overflow: hidden;
+  box-shadow: 0 0 0 1px {ACCENT}22, 0 10px 40px -12px {ACCENT}55;
 }}
-.mm-header-strip h1 {{ margin: 0; font-size: 1.6rem; color: {WHITE}; }}
-.mm-header-strip p {{ margin: 4px 0 0 0; font-size: 0.9rem; opacity: 0.9; }}
-.stButton > button[kind="primary"] {{
-  background-color: {ACCENT}; border: 1px solid {ACCENT}; color: {WHITE};
+.mm-header-strip::before {{
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 3px;
+  background: linear-gradient(90deg, {ACCENT}, {CYAN});
 }}
+.mm-header-strip h1 {{
+  margin: 0; font-size: 1.9rem; font-weight: 800; border: none; padding: 0;
+  background: linear-gradient(90deg, {ACCENT}, {CYAN});
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}}
+.mm-header-strip p {{
+  margin: 6px 0 0 0; font-size: 0.85rem; color: {NEUTRAL};
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.04em;
+}}
+
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
+  background: linear-gradient(135deg, {ACCENT} 0%, #D91A53 100%); color: #FFFFFF;
+  border: none; border-radius: 8px; font-weight: 600; padding: 0.5rem 1.1rem;
+  box-shadow: 0 4px 12px rgba(255, 42, 109, 0.3); transition: all 0.2s ease-in-out;
+}}
+.stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {{
+  color: #FFFFFF; opacity: 0.92; transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(255, 42, 109, 0.5);
+}}
+.stButton > button:active, .stFormSubmitButton > button:active {{ transform: translateY(0); }}
+.stButton > button:focus:not(:active), .stFormSubmitButton > button:focus:not(:active) {{
+  color: #FFFFFF; border: none; box-shadow: 0 0 0 2px {CYAN}88, 0 4px 12px rgba(255, 42, 109, 0.4);
+}}
+.stButton > button p, .stFormSubmitButton > button p {{ color: #FFFFFF !important; font-weight: 600; }}
+
+div[data-baseweb="select"] > div, div[data-baseweb="input"], div[data-baseweb="base-input"],
+div[data-baseweb="textarea"], [data-testid="stNumberInputContainer"] {{
+  background-color: {INPUT_BG} !important; border: 1px solid {INPUT_BORDER} !important;
+  border-radius: 8px !important; color: {WHITE} !important;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}}
+div[data-baseweb="input"] > div, div[data-baseweb="base-input"] > div,
+div[data-baseweb="input"] input, div[data-baseweb="base-input"] input,
+div[data-baseweb="textarea"] textarea, [data-testid="stNumberInputContainer"] input {{
+  background-color: transparent !important; border: none !important; color: {WHITE} !important;
+}}
+div[data-baseweb="select"] > div:hover, div[data-baseweb="input"]:hover,
+div[data-baseweb="textarea"]:hover, [data-testid="stNumberInputContainer"]:hover {{
+  border-color: {ACCENT}AA !important;
+}}
+div[data-baseweb="select"] > div:focus-within, div[data-baseweb="input"]:focus-within,
+div[data-baseweb="textarea"]:focus-within, [data-testid="stNumberInputContainer"]:focus-within {{
+  border-color: {CYAN} !important;
+  box-shadow: 0 0 0 1px {CYAN}66, 0 0 18px -4px {CYAN}88, 0 0 28px -10px {ACCENT}88 !important;
+}}
+[data-testid="stNumberInputContainer"] button {{
+  background-color: transparent !important; color: {NEUTRAL} !important; border: none !important;
+}}
+[data-testid="stNumberInputContainer"] button:hover {{ color: {ACCENT} !important; background-color: {ACCENT}14 !important; }}
+div[data-baseweb="popover"] ul[role="listbox"] {{
+  background-color: {INPUT_BG} !important; border: 1px solid {INPUT_BORDER}; border-radius: 10px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+}}
+div[data-baseweb="popover"] li[role="option"]:hover, div[data-baseweb="popover"] li[aria-selected="true"] {{
+  background-color: {ACCENT}22 !important;
+}}
+span[data-baseweb="tag"] {{ background-color: {ACCENT}33 !important; border: 1px solid {ACCENT}88; border-radius: 6px; }}
+[data-testid="stCheckbox"] label span:first-child {{ border-color: {INPUT_BORDER} !important; border-radius: 5px; }}
+
 [data-testid="stMetric"] {{
-  background-color: {CARD}; border: 1px solid {NEUTRAL}66; border-radius: 6px; padding: 10px 14px;
+  background-color: {CARD}; border: 1px solid {BORDER}; border-radius: 14px; padding: 16px 18px;
+  box-shadow: inset 0 1px 0 #FFFFFF08;
 }}
+[data-testid="stMetricLabel"] {{
+  color: {NEUTRAL} !important; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.08em;
+}}
+[data-testid="stMetricValue"] {{ color: {CYAN} !important; font-weight: 700; text-shadow: 0 0 12px {CYAN}55; }}
+
+[data-testid="stForm"], [data-testid="stVerticalBlockBorderWrapper"] {{
+  background: linear-gradient(180deg, {CARD}F2 0%, {CARD}CC 100%) !important;
+  border: 1px solid {BORDER} !important; border-radius: 12px !important;
+  padding: 20px !important; margin-bottom: 18px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), inset 0 1px 0 #FFFFFF0A;
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stVerticalBlockBorderWrapper"] {{
+  box-shadow: none; padding: 14px !important; background: {INPUT_BG}80 !important;
+}}
+[data-testid="stExpander"] {{
+  border: 1px solid {BORDER} !important; border-radius: 12px !important; background-color: {CARD}CC;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+}}
+[data-testid="stExpander"] details {{ border: none !important; }}
+[data-testid="stExpander"] summary:hover {{ color: {CYAN}; }}
+[data-testid="stAlert"] {{ border-radius: 10px; border: 1px solid {BORDER}; }}
+[data-testid="stStatusWidget"], [data-testid="stStatus"] {{
+  background-color: {CARD}; border: 1px solid {BORDER}; border-radius: 10px;
+}}
+
+.stTabs [data-baseweb="tab-list"] {{ gap: 6px; border-bottom: 1px solid {BORDER}; }}
+.stTabs [data-baseweb="tab"] {{ border-radius: 10px 10px 0 0; padding: 8px 16px; color: {NEUTRAL}; }}
+.stTabs [aria-selected="true"] {{ color: {WHITE} !important; background-color: {ACCENT}1A; }}
+.stTabs [data-baseweb="tab-highlight"] {{ background-color: {ACCENT}; }}
+
+[data-testid="stDataFrame"], [data-testid="stJson"] {{
+  border: 1px solid {BORDER}; border-radius: 12px; overflow: hidden;
+}}
+table {{
+  background-color: {CARD} !important; border: 1px solid {BORDER} !important;
+  border-radius: 8px; border-collapse: separate !important; border-spacing: 0; overflow: hidden;
+}}
+th {{
+  background-color: {INPUT_BG} !important; color: {CYAN} !important; font-weight: 600;
+  font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.08em;
+}}
+td {{ border-bottom: 1px solid {BORDER} !important; color: #C5C9D1 !important; }}
+
+.ox-table {{ width: 100%; font-size: 0.85rem; margin: 6px 0 4px 0; }}
+.ox-table th, .ox-table td {{ padding: 10px 14px; text-align: left; border-left: none !important; border-right: none !important; }}
+.ox-table th {{ border-bottom: 1px solid {INPUT_BORDER} !important; border-top: none !important; }}
+.ox-table tr:last-child td {{ border-bottom: none !important; }}
+.ox-table tbody tr {{ transition: background-color 0.12s ease; }}
+.ox-table tbody tr:hover td {{ background-color: {ACCENT}0D; }}
+.ox-table td.ox-node {{ font-family: 'JetBrains Mono', ui-monospace, monospace; color: {WHITE} !important; white-space: nowrap; }}
+.ox-table td.ox-num {{ color: {NEUTRAL} !important; text-align: center; width: 80px; }}
+.ox-table td.ox-detail {{ color: #AEB4C2 !important; line-height: 1.5; }}
+
+.ox-pill {{
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap;
+  font-family: 'JetBrains Mono', ui-monospace, monospace; border: 1px solid transparent;
+}}
+.ox-pill::before {{ content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; }}
+.ox-pill.ok {{ color: {SUCCESS}; background-color: {SUCCESS}14; border-color: {SUCCESS}44; }}
+.ox-pill.warn {{ color: {WARNING}; background-color: {WARNING}14; border-color: {WARNING}44; }}
+.ox-pill.err {{ color: {ERROR}; background-color: {ERROR}14; border-color: {ERROR}44; }}
+.ox-pill.info {{ color: {CYAN}; background-color: {CYAN}14; border-color: {CYAN}44; }}
+.ox-pill.run {{ color: {ACCENT}; background-color: {ACCENT}1A; border-color: {ACCENT}66; animation: ox-pulse 1.4s ease-in-out infinite; }}
+.ox-pill.idle {{ color: {NEUTRAL}; background-color: {NEUTRAL}14; border-color: {NEUTRAL}33; }}
+@keyframes ox-pulse {{ 0%, 100% {{ box-shadow: 0 0 0 0 {ACCENT}55; }} 50% {{ box-shadow: 0 0 0 4px {ACCENT}00; }} }}
+
+.ox-stats {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 4px 0 12px 0; }}
+.ox-stat {{
+  background-color: {INPUT_BG}; border: 1px solid {INPUT_BORDER}; border-radius: 10px;
+  padding: 8px 14px; min-width: 120px;
+}}
+.ox-stat .k {{ color: {NEUTRAL}; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }}
+.ox-stat .v {{ color: {WHITE}; font-size: 0.95rem; font-weight: 600; margin-top: 2px; font-family: 'JetBrains Mono', ui-monospace, monospace; }}
+.ox-conn {{ display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 0.82rem; color: #AEB4C2; }}
+.ox-log {{
+  background: {INPUT_BG}; border: 1px solid {BORDER}; border-radius: 8px;
+  padding: 12px 14px; margin: 0 0 10px 0; max-height: 320px; overflow: auto;
+  color: #C5C9D1; font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.78rem; line-height: 1.55; white-space: pre-wrap;
+}}
+.ox-video-note {{ color: {NEUTRAL}; font-size: 0.8rem; margin: 4px 0 10px 0; }}
+code {{ color: {CYAN} !important; background-color: {CYAN}12 !important; border-radius: 6px; }}
+
 .config-box {{
-  background-color: {CARD}; border: 1px solid {NEUTRAL}66; border-radius: 6px;
-  padding: 10px 12px; font-size: 0.82rem; line-height: 1.6; margin: 8px 0 14px 0;
+  background-color: {CARD}; border: 1px solid {BORDER}; border-radius: 12px;
+  padding: 14px 16px; font-size: 0.82rem; line-height: 1.7; margin: 8px 0 16px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }}
 .exit-banner {{
-  background-color: {CARD}; border-left: 6px solid {NEUTRAL}; border-radius: 4px;
-  padding: 14px 18px; margin: 12px 0;
+  background-color: {CARD}; border: 1px solid {BORDER}; border-left: 4px solid {NEUTRAL};
+  border-radius: 12px; padding: 16px 20px; margin: 14px 0;
 }}
-.exit-banner h3 {{ margin: 0 0 4px 0; font-size: 1.05rem; }}
-.exit-banner p {{ margin: 0; color: #d0d2d6; font-size: 0.9rem; }}
-.exit-success {{ border-left-color: {SUCCESS}; }} .exit-success h3 {{ color: {SUCCESS}; }}
-.exit-warning {{ border-left-color: {WARNING}; }} .exit-warning h3 {{ color: {WARNING}; }}
-.exit-error {{ border-left-color: {ERROR}; }} .exit-error h3 {{ color: {ERROR}; }}
-.pipeline-row {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 4px 0; }}
+.exit-banner h3 {{ margin: 0 0 4px 0; font-size: 1.05rem; border: none; padding: 0; letter-spacing: 0.06em; }}
+.exit-banner p {{ margin: 0; color: {WHITE}cc; font-size: 0.9rem; }}
+.exit-success {{ border-left-color: {SUCCESS}; box-shadow: -6px 0 24px -12px {SUCCESS}; }}
+.exit-success h3 {{ color: {SUCCESS}; }}
+.exit-warning {{ border-left-color: {WARNING}; box-shadow: -6px 0 24px -12px {WARNING}; }}
+.exit-warning h3 {{ color: {WARNING}; }}
+.exit-error {{ border-left-color: {ERROR}; box-shadow: -6px 0 24px -12px {ERROR}; }}
+.exit-error h3 {{ color: {ERROR}; }}
+
+.pipeline-row {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0 6px 0; }}
 .pipeline-step {{
-  border: 1px solid {NEUTRAL}; color: {NEUTRAL}; border-radius: 14px;
-  padding: 4px 12px; font-size: 0.8rem; font-family: monospace;
+  border: 1px solid {BORDER}; color: {NEUTRAL}; background-color: {CARD}; border-radius: 999px;
+  padding: 5px 14px; font-size: 0.78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }}
-.pipeline-step.done {{ border-color: {SUCCESS}; color: {SUCCESS}; }}
-.pipeline-step.active {{ border-color: {ACCENT}; color: {WHITE}; background-color: {ACCENT}; }}
-.pipeline-step.failed {{ border-color: {ERROR}; color: {ERROR}; }}
-.pipeline-arrow {{ color: {NEUTRAL}; }}
+.pipeline-step.done {{ border-color: {SUCCESS}88; color: {SUCCESS}; box-shadow: 0 0 10px {SUCCESS}33; }}
+.pipeline-step.active {{
+  border-color: {ACCENT}; color: #FFFFFF; background-color: {ACCENT}; box-shadow: 0 0 16px {ACCENT}88;
+}}
+.pipeline-step.failed {{ border-color: {ERROR}; color: {ERROR}; box-shadow: 0 0 10px {ERROR}44; }}
+.pipeline-arrow {{ color: {CYAN}88; }}
 </style>
 """
 
@@ -285,20 +569,26 @@ def page_environment() -> None:
     _init_env_session()
 
     overrides = st.session_state.env_overrides
-    for key in SESSION_ENV_KEYS:
-        current = overrides.get(key, os.environ.get(key, ""))
-        overrides[key] = st.text_input(key, value=current or "", type="password" if "TOKEN" in key or "KEY" in key else "default")
+    with st.container(border=True):
+        _section("Credentials & settings", f"{len(SESSION_ENV_KEYS)} keys")
+        cols = st.columns(2)
+        for idx, key in enumerate(SESSION_ENV_KEYS):
+            current = overrides.get(key, os.environ.get(key, ""))
+            with cols[idx % 2]:
+                overrides[key] = st.text_input(
+                    key, value=current or "", type="password" if "TOKEN" in key or "KEY" in key else "default"
+                )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Apply to session", type="primary"):
-            st.session_state.env_overrides = overrides
-            _apply_env_overrides()
-            st.success("Session environment updated.")
-    with col2:
-        if st.button("Clear session overrides"):
-            _clear_env_overrides()
-            st.info("Restored environment from dashboard startup snapshot.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Apply to session", type="primary", width="stretch"):
+                st.session_state.env_overrides = overrides
+                _apply_env_overrides()
+                st.success("Session environment updated.")
+        with col2:
+            if st.button("Clear session overrides", width="stretch"):
+                _clear_env_overrides()
+                st.info("Restored environment from dashboard startup snapshot.")
 
 
 def _load_yaml_raw(stem: str) -> dict:
@@ -397,22 +687,27 @@ def page_dependency_graph() -> None:
         st.info("Create at least one project first.")
         return
 
-    primary = st.selectbox("Primary app (pipeline target)", apps)
-    cfg = load_app_config(primary, project_root=ROOT)
-    known = [a for a in apps if a != primary]
-    current_deps = [d.app for d in cfg.dependencies]
+    with st.container(border=True):
+        _section("Dependencies", "repos the primary app consumes")
+        primary = st.selectbox("Primary app (pipeline target)", apps)
+        cfg = load_app_config(primary, project_root=ROOT)
+        known = [a for a in apps if a != primary]
+        current_deps = [d.app for d in cfg.dependencies]
 
-    selected = st.multiselect("Dependencies", known, default=[d for d in current_deps if d in known])
-    rel = st.text_input("Relationship label", value="library")
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            selected = st.multiselect("Dependencies", known, default=[d for d in current_deps if d in known])
+        with c2:
+            rel = st.text_input("Relationship label", value="library")
 
-    if st.button("Save dependencies"):
-        data = _load_yaml_raw(primary)
-        data["dependencies"] = [{"app": name, "relationship": rel} for name in selected]
-        try:
-            save_app_config_yaml(primary, data, project_root=ROOT)
-            st.success("Dependency list saved.")
-        except ConfigError as exc:
-            st.error(str(exc))
+        if st.button("Save dependencies"):
+            data = _load_yaml_raw(primary)
+            data["dependencies"] = [{"app": name, "relationship": rel} for name in selected]
+            try:
+                save_app_config_yaml(primary, data, project_root=ROOT)
+                st.success("Dependency list saved.")
+            except ConfigError as exc:
+                st.error(str(exc))
 
     adj = dependency_adjacency(ROOT)
     cycle = find_dependency_cycle(primary, adj)
@@ -432,27 +727,37 @@ def page_dependency_graph() -> None:
     )
 
 
+def _auth_result_html(status: Any) -> str:
+    if getattr(status, "authenticated", False):
+        tone, label = ("ok", "connected") if getattr(status, "can_write", None) is not False else ("warn", "read-only")
+    else:
+        tone, label = "err", "not connected"
+    message = getattr(status, "error", None) or getattr(status, "detail", "") or ""
+    return f"<div class='ox-conn'>{_pill(label, tone)}<span>{html.escape(str(message))}</span></div>"
+
+
 def _connection_tests(cfg: AppConfig) -> None:
-    st.markdown("**Connection tests**")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Test Jira"):
-            jira = cfg.integrations.jira
-            if not jira or not jira.base_url:
-                st.warning("Configure Jira on the project first.")
-            else:
-                _apply_env_overrides()
-                status = jira_api.check_auth(jira.base_url, jira.project_key)
-                st.write(status)
-    with c2:
-        if st.button("Test GitLab"):
-            gl = cfg.integrations.gitlab
-            if not gl or not gl.host:
-                st.warning("Configure GitLab on the project first.")
-            else:
-                _apply_env_overrides()
-                status = gitlab_api.check_auth(gl.host, gl.project_path or cfg.repo)
-                st.write(status)
+    with st.container(border=True):
+        _section("Connection tests", "verify integrations before running in real mode")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Test Jira", width="stretch"):
+                jira = cfg.integrations.jira
+                if not jira or not jira.base_url:
+                    st.markdown(_pill("Configure Jira on the project first", "warn"), unsafe_allow_html=True)
+                else:
+                    _apply_env_overrides()
+                    status = jira_api.check_auth(jira.base_url, jira.project_key)
+                    st.markdown(_auth_result_html(status), unsafe_allow_html=True)
+        with c2:
+            if st.button("Test GitLab", width="stretch"):
+                gl = cfg.integrations.gitlab
+                if not gl or not gl.host:
+                    st.markdown(_pill("Configure GitLab on the project first", "warn"), unsafe_allow_html=True)
+                else:
+                    _apply_env_overrides()
+                    status = gitlab_api.check_auth(gl.host, gl.project_path or cfg.repo)
+                    st.markdown(_auth_result_html(status), unsafe_allow_html=True)
 
 
 def page_run_pipeline() -> None:
@@ -461,54 +766,79 @@ def page_run_pipeline() -> None:
         st.error("No app configs in apps/.")
         return
 
-    app_name = st.selectbox("Primary app", apps, index=apps.index("sample_android") if "sample_android" in apps else 0)
-    mode = st.selectbox("Mode", ["mock", "real"], index=0)
+    with st.container(border=True):
+        _section("Pipeline configuration", "target app and execution mode")
+        c1, c2 = st.columns(2)
+        with c1:
+            app_name = st.selectbox(
+                "Primary app", apps, index=apps.index("sample_android") if "sample_android" in apps else 0
+            )
+        with c2:
+            mode = st.selectbox("Mode", ["mock", "real"], index=0)
 
-    try:
-        cfg = load_app_config(app_name, project_root=ROOT)
-    except ConfigError as exc:
-        st.error(str(exc))
-        cfg = None
+        try:
+            cfg = load_app_config(app_name, project_root=ROOT)
+        except ConfigError as exc:
+            st.error(str(exc))
+            cfg = None
 
-    scenario = None
-    if mode == "mock":
-        scenario = st.selectbox("Mock scenario", list(SCENARIOS), index=list(SCENARIOS).index("fix_success"))
+        c3, c4 = st.columns(2)
+        scenario = None
+        with c3:
+            if mode == "mock":
+                scenario = st.selectbox("Mock scenario", list(SCENARIOS), index=list(SCENARIOS).index("fix_success"))
+            else:
+                st.selectbox("Mock scenario", ["— (real mode)"], disabled=True)
+        with c4:
+            max_attempts = st.number_input("Max attempts", min_value=1, max_value=10, value=3, step=1)
+        dry_run = st.checkbox("Dry run (real: no publish/push)", value=False, disabled=(mode == "mock"))
 
-    max_attempts = st.number_input("Max attempts", min_value=1, max_value=10, value=3, step=1)
-    dry_run = st.checkbox("Dry run (real: no publish/push)", value=False, disabled=(mode == "mock"))
+        if cfg is not None:
+            st.markdown(
+                _stats_html(
+                    [
+                        ("Platform", html.escape(cfg.platform)),
+                        ("Repo", html.escape(str(cfg.repo))),
+                        ("Mode", _pill(mode, "run" if mode == "real" else "info")),
+                    ]
+                ),
+                unsafe_allow_html=True,
+            )
 
     flow = "default_flow"
     jira_issue = ""
     if mode == "real" and cfg is not None:
-        flows = _list_maestro_flows(cfg)
-        if flows:
-            flow = st.selectbox(
-                "Maestro flow (retest after fix)",
-                flows,
-                help="YAML file under flows_dir. Used after dev_agent to verify the fix (and for Jira+LLM verification screenshots).",
-            )
-        else:
-            st.warning(
-                f"No Maestro flows found under `{cfg.flows_dir}`. "
-                "Set flows_dir in the app config or add .yaml flows there."
-            )
-            flow = st.text_input(
-                "Maestro flow filename",
-                value="login.yaml",
-                help="e.g. login.yaml — must exist under the app's flows_dir.",
-            )
+        with st.container(border=True):
+            _section("Real-mode inputs", "Maestro flow and optional Jira intake")
+            flows = _list_maestro_flows(cfg)
+            if flows:
+                flow = st.selectbox(
+                    "Maestro flow (retest after fix)",
+                    flows,
+                    help="YAML file under flows_dir. Used after dev_agent to verify the fix (and for Jira+LLM verification screenshots).",
+                )
+            else:
+                st.warning(
+                    f"No Maestro flows found under `{cfg.flows_dir}`. "
+                    "Set flows_dir in the app config or add .yaml flows there."
+                )
+                flow = st.text_input(
+                    "Maestro flow filename",
+                    value="login.yaml",
+                    help="e.g. login.yaml — must exist under the app's flows_dir.",
+                )
 
-        jira_issue = st.text_input(
-            "Jira issue (optional)",
-            value="",
-            placeholder="WFDR-25182 or https://…/browse/WFDR-25182",
-            help="When set, skips initial Maestro QA and starts from this ticket (attachments + video frames).",
-        )
+            jira_issue = st.text_input(
+                "Jira issue (optional)",
+                value="",
+                placeholder="WFDR-25182 or https://…/browse/WFDR-25182",
+                help="When set, skips initial Maestro QA and starts from this ticket (attachments + video frames).",
+            )
 
     if cfg is not None:
         _connection_tests(cfg)
 
-    if st.button("Trigger Agent Pipeline", type="primary"):
+    if st.button("Trigger Agent Pipeline", type="primary", width="stretch"):
         _apply_env_overrides()
         try:
             if cfg is None:
@@ -604,6 +934,97 @@ def _kv(data: dict | None, keys: list[str]) -> None:
             st.write(value)
 
 
+_VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
+
+
+def _existing_videos(raw_paths: list) -> list[Path]:
+    """Keep real video files, and any video sitting next to saved evidence (Jira attachments, run dirs)."""
+    found: list[Path] = []
+    seen: set[Path] = set()
+    scanned: set[Path] = set()
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return
+        if resolved in seen or resolved.suffix.lower() not in _VIDEO_SUFFIXES or not resolved.is_file():
+            return
+        if resolved.stat().st_size <= 0:
+            return
+        seen.add(resolved)
+        found.append(resolved)
+
+    for raw in raw_paths:
+        if not raw:
+            continue
+        path = Path(str(raw))
+        add(path)
+        for directory in (
+            path.parent,
+            path.parent.parent,
+            path.parent / "attachments",
+            path.parent.parent / "attachments",
+        ):
+            if directory in scanned or not directory.is_dir():
+                continue
+            scanned.add(directory)
+            for child in directory.iterdir():
+                add(child)
+    return found
+
+
+def _before_videos(final: dict) -> list[Path]:
+    baseline = final.get("jira_baseline") or {}
+    seeds = list(final.get("before_video_paths") or [])
+    seeds.extend(baseline.get("baseline_video_paths") or [])
+    seeds.extend(baseline.get("baseline_evidence_paths") or [])
+    # After a retest, qa_finding is the latest failure, so it is not the "before" recording.
+    if not final.get("retest_finding"):
+        qa = final.get("qa_finding") or {}
+        seeds.extend(qa.get("video_paths") or [])
+        seeds.extend(qa.get("evidence_paths") or [])
+    return _existing_videos(seeds)
+
+
+def _after_videos(final: dict) -> list[Path]:
+    retest = final.get("retest_finding") or {}
+    primary = retest.get("primary_result") or {}
+    seeds = list(final.get("after_video_paths") or [])
+    seeds.extend(primary.get("video_paths") or [])
+    seeds.extend(primary.get("evidence_paths") or [])
+    return _existing_videos(seeds)
+
+
+def _render_video_column(title: str, caption: str, videos: list[Path]) -> None:
+    st.markdown(f"**{html.escape(title)}**")
+    st.markdown(f"<p class='ox-video-note'>{html.escape(caption)}</p>", unsafe_allow_html=True)
+    if not videos:
+        st.markdown(_pill("No recording yet", "idle"), unsafe_allow_html=True)
+        return
+    for path in videos:
+        st.video(str(path))
+        st.caption(path.name)
+
+
+def _render_recordings(final: dict) -> None:
+    with st.container(border=True):
+        _section("Screen recordings", "before the fix, and after the fix")
+        left, right = st.columns(2)
+        with left:
+            _render_video_column(
+                "Before fix",
+                "Jira attachment, or the screen recording from the first agent run.",
+                _before_videos(final),
+            )
+        with right:
+            _render_video_column(
+                "After fix",
+                "Screen recording captured during the retest run.",
+                _after_videos(final),
+            )
+
+
 def _render_results(final: dict) -> None:
     last_run = st.session_state.get("last_run") or {}
     duration = last_run.get("duration_sec")
@@ -613,25 +1034,22 @@ def _render_results(final: dict) -> None:
     css, title, msg = _banner(final)
     st.markdown(_step_chips(final), unsafe_allow_html=True)
     st.markdown(f"<div class='exit-banner {css}'><h3>{title}</h3><p>{msg}</p></div>", unsafe_allow_html=True)
+    _render_recordings(final)
+
+    st.markdown(
+        _stats_html(
+            [
+                ("Final status", _pill(final.get("status"))),
+                ("Attempts", f"{final.get('attempt_count', 0)}/{final.get('max_attempts', '?')}"),
+                ("Failure type", _pill((final.get("qa_finding") or {}).get("failure_type") or "n/a", "info")),
+                ("Ticket", html.escape(str(final.get("ticket_id") or "—"))),
+            ]
+        ),
+        unsafe_allow_html=True,
+    )
 
     with st.expander("Execution log (all steps)", expanded=False):
-        history = final.get("execution_history") or []
-        if history:
-            st.dataframe(
-                [
-                    {
-                        "node": r.get("node"),
-                        "status": r.get("status"),
-                        "attempt": r.get("attempt_count"),
-                        "detail": r.get("detail"),
-                    }
-                    for r in history
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.write("No steps recorded.")
+        st.markdown(_history_table_html(final.get("execution_history") or []), unsafe_allow_html=True)
 
     tab_rca, tab_dev, tab_qa, tab_raw = st.tabs(
         ["Ticket & RCA", "Dev & MR", "QA & Retest", "Raw JSON"]
@@ -649,16 +1067,16 @@ def _render_results(final: dict) -> None:
             st.markdown(f"[Merge request]({final['pr_url']})")
     with tab_qa:
         _kv(final.get("qa_finding"), ["failure_type", "description", "evidence_paths"])
-        st.dataframe(_jsonable(final.get("execution_history", [])), use_container_width=True)
+        st.markdown(_history_table_html(final.get("execution_history") or []), unsafe_allow_html=True)
     with tab_raw:
         st.json(_jsonable(final))
 
 
 def main() -> None:
-    st.set_page_config(page_title="Vibeathon QA Pipeline", page_icon="🚀", layout="wide")
+    st.set_page_config(page_title="One-X Agent (Self Healing)", page_icon="🚀", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown(
-        "<div class='mm-header-strip'><h1>Vibeathon QA Pipeline</h1>"
+        "<div class='mm-header-strip'><h1>One-X Agent (Self Healing)</h1>"
         "<p>Multi-project · GitLab · Jira · LangGraph</p></div>",
         unsafe_allow_html=True,
     )

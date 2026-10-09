@@ -238,6 +238,7 @@ def _finalize_success(
         "last_error": None,
         "screenshots": evidence_paths,
         "retest_finding": retest_finding,
+        "after_video_paths": list(primary_finding.video_paths),
         "execution_history": [history],
     }
 
@@ -283,5 +284,6 @@ def _finalize_failure(
         # failed-fix evidence available for the next RCA attempt" rule.
         "qa_finding": asdict(focus_finding),
         "retest_finding": retest_finding,
+        "after_video_paths": list(primary_finding.video_paths) if primary_finding else [],
         "execution_history": [history],
     }

@@ -118,6 +118,7 @@ def intake_from_jira(
         confidence=confidence,
         reproduction_steps=repro_steps,
         evidence_paths=evidence_paths,
+        video_paths=[str(path) for path in downloaded if is_video_path(path)],
     )
 
     baseline = build_baseline_from_intake(
@@ -127,6 +128,7 @@ def intake_from_jira(
         details.description_text,
         finding,
     )
+    baseline["baseline_video_paths"] = list(finding.video_paths)
 
     return JiraIntakeResult(
         success=True,
