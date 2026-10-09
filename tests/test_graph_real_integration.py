@@ -180,18 +180,21 @@ def _patch_all_external(monkeypatch, repo_dir: Path, maestro_results: list[Maest
     call_count, apply_fix = _make_fake_claude(repo_dir)
     checkout_calls: list[list[str]] = []
 
+    from nodes.dev_agent import ClaudeCodeResult
+
+    def fake_invoke(app_config, prompt, timeout=1800.0):
+        apply_fix()
+        return ClaudeCodeResult(
+            success=True,
+            summary=f"Fixed LoginButton null-pointer crash (attempt #{call_count['n']}).",
+        )
+
     def fake_dev_run_command(argv, cwd, timeout=120.0, env=None):
-        if argv and argv[0] == "claude":
-            apply_fix()
-            return CommandResult(
-                argv=argv, returncode=0,
-                stdout=json.dumps({"result": f"Fixed LoginButton null-pointer crash (attempt #{call_count['n']})."}),
-                stderr="",
-            )
         if argv[:2] == ["git", "checkout"]:
             checkout_calls.append(list(argv))
         return real_run_command(argv, cwd=cwd, timeout=timeout, env=env)
 
+    monkeypatch.setattr(dev_agent_mod, "_invoke_claude_code", fake_invoke)
     monkeypatch.setattr(dev_agent_mod, "run_command", fake_dev_run_command)
 
     # --- retest_agent: mocked build/install/device (maestro/LLM already covered above) ---
@@ -215,7 +218,7 @@ def _patch_all_external(monkeypatch, repo_dir: Path, maestro_results: list[Maest
         "comment_calls": comment_calls,
         "create_pr_calls": create_pr_calls,
         "checkout_calls": checkout_calls,
-        "claude_calls": call_count,
+        "coding_agent_calls": call_count,
     }
 
 
@@ -254,7 +257,7 @@ def test_full_pipeline_fails_once_then_succeeds(tmp_path, monkeypatch, app_name)
     assert len(spies["create_pr_calls"]) == 1
     assert spies["create_pr_calls"][0]["head"] == "ai-fix/99"
     assert spies["create_pr_calls"][0]["base"] == "main"
-    assert spies["claude_calls"]["n"] == 2  # exactly one Claude Code invocation per attempt
+    assert spies["coding_agent_calls"]["n"] == 2  # exactly one Cursor agent invocation per attempt
 
     # requirement #8: evidence/findings survived the whole run.
     assert final_state["rca_finding"]["root_cause_hypothesis"]
@@ -287,7 +290,7 @@ def test_qa_pass_terminates_immediately_without_ticket_or_dev_work(tmp_path, mon
     assert final_state["passed"] is True
     assert [r["node"] for r in final_state["execution_history"]] == ["qa_agent"]
     assert spies["create_issue_calls"] == []
-    assert spies["claude_calls"]["n"] == 0
+    assert spies["coding_agent_calls"]["n"] == 0
 
 
 def test_unverified_qa_result_is_blocked_without_ticket(tmp_path, monkeypatch):

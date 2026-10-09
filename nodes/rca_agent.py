@@ -26,12 +26,13 @@ trace/function that wasn't actually seen.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from config import AppConfig
+from config import AppConfig, figma_context_lines
 from state import PipelineState, log_node
 from utils.llm import ask_for_json
 from utils.paths import PathSecurityError, ensure_within
@@ -47,6 +48,10 @@ _MAX_DIFF_CHARS = 6_000
 _MAX_LINES_PER_FILE = 200
 _MAX_FILES_READ = 8
 _MAX_EVIDENCE_IMAGES = 3
+# The agent greps/reads the repos itself, so this is slower than a one-shot call.
+_RCA_AGENT_TIMEOUT = float(os.environ.get("RCA_AGENT_TIMEOUT", "420"))
+_RCA_AGENT_TOOLS = ["read", "grep", "glob", "ls", "semSearch"]
+_MAX_VERIFY_BYTES = 400_000
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 _SEARCH_STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "to",
@@ -67,6 +72,7 @@ class RCAFinding:
     confidence: float = 0.0
     suggested_fix: str = ""
     missing_information: list[str] = field(default_factory=list)
+    target_app: str = ""
 
 
 @dataclass
@@ -74,6 +80,7 @@ class RepoMatch:
     file_path: str
     line_number: int
     line_text: str
+    repo_app: str = ""
 
 
 @dataclass
@@ -159,7 +166,11 @@ def _run_real(state: PipelineState) -> dict:
         )
         return _finalize(finding, attempt_count)
 
-    finding = _analyze_app_failure(app_config, qa_finding)
+    project_graph: dict[str, AppConfig] = state.get("project_graph") or {
+        state.get("app_name", app_config.name): app_config
+    }
+    primary_stem = state.get("app_name", app_config.name)
+    finding = _analyze_app_failure(primary_stem, project_graph, qa_finding)
     return _finalize(finding, attempt_count)
 
 
@@ -183,38 +194,90 @@ def _unresolved_finding(missing_information: list[str]) -> RCAFinding:
     )
 
 
-def _analyze_app_failure(app_config: AppConfig, qa_finding: dict[str, Any]) -> RCAFinding:
-    missing_information: list[str] = []
+def _evidence_id(repo_app: str, relative_path: str) -> str:
+    return f"{repo_app}::{relative_path}" if repo_app else relative_path
 
-    logs_result = get_device_logs(app_config)
+
+def _analyze_app_failure(
+    primary_stem: str,
+    project_graph: dict[str, AppConfig],
+    qa_finding: dict[str, Any],
+) -> RCAFinding:
+    missing_information: list[str] = []
+    primary_config = project_graph.get(primary_stem) or next(iter(project_graph.values()))
+
+    print("[rca_agent] capturing device logs...", flush=True)
+    logs_result = get_device_logs(primary_config)
     if not logs_result.success:
         missing_information.append(f"Could not capture device logs: {logs_result.error}")
+        print(f"[rca_agent] logs unavailable: {logs_result.error}", flush=True)
+    else:
+        print(f"[rca_agent] logs captured ({len(logs_result.logs)} chars)", flush=True)
 
     search_hits: list[RepoMatch] = []
-    for term in _extract_search_terms(qa_finding):
-        search_hits.extend(search_repository(app_config, term))
+    terms = _extract_search_terms(qa_finding)[:8]
+    print(f"[rca_agent] searching {len(project_graph)} repo(s) for {len(terms)} term(s)...", flush=True)
+    for repo_app, cfg in project_graph.items():
+        for term in terms:
+            for hit in search_repository(cfg, term):
+                search_hits.append(
+                    RepoMatch(
+                        file_path=hit.file_path,
+                        line_number=hit.line_number,
+                        line_text=hit.line_text,
+                        repo_app=repo_app,
+                    )
+                )
     if not search_hits:
         missing_information.append("No repository search hits for the terms extracted from the QA finding.")
 
-    diff_result = inspect_git_diff(app_config)
-    if not diff_result.success:
-        missing_information.append(f"Could not inspect git history: {diff_result.error}")
+    diff_by_repo: dict[str, GitDiffResult] = {}
+    for repo_app, cfg in project_graph.items():
+        diff_by_repo[repo_app] = inspect_git_diff(cfg)
+        if not diff_by_repo[repo_app].success:
+            missing_information.append(
+                f"Could not inspect git history for '{repo_app}': {diff_by_repo[repo_app].error}"
+            )
 
-    candidate_paths = sorted({hit.file_path for hit in search_hits} | set(diff_result.changed_files))
-    file_excerpts = read_relevant_files(app_config, candidate_paths) if candidate_paths else {}
+    file_excerpts: dict[str, str] = {}
+    for repo_app, cfg in project_graph.items():
+        diff_result = diff_by_repo[repo_app]
+        repo_hits = {hit.file_path for hit in search_hits if hit.repo_app == repo_app}
+        candidate_paths = sorted(repo_hits | set(diff_result.changed_files))
+        for rel_path, text in read_relevant_files(cfg, candidate_paths).items():
+            file_excerpts[_evidence_id(repo_app, rel_path)] = text
 
-    gathered_evidence_paths = (
-        set(file_excerpts.keys()) | {hit.file_path for hit in search_hits} | set(diff_result.changed_files)
-    )
+    gathered_evidence_paths: set[str] = set(file_excerpts.keys())
+    for hit in search_hits:
+        gathered_evidence_paths.add(_evidence_id(hit.repo_app, hit.file_path))
+    for repo_app, diff_result in diff_by_repo.items():
+        for path in diff_result.changed_files:
+            gathered_evidence_paths.add(_evidence_id(repo_app, path))
 
-    if not logs_result.success and not search_hits and not diff_result.success and not file_excerpts:
+    if not logs_result.success and not search_hits and not file_excerpts:
         missing_information.append("No logs, repository matches, git history, or file excerpts could be gathered.")
         return _unresolved_finding(missing_information)
 
     screenshots = _evidence_images(qa_finding)
-    llm_data = _ask_llm_for_root_cause(app_config, qa_finding, logs_result, search_hits, diff_result, file_excerpts, screenshots)
+    llm_data = _ask_llm_for_root_cause(
+        primary_stem,
+        project_graph,
+        qa_finding,
+        logs_result,
+        search_hits,
+        diff_by_repo,
+        file_excerpts,
+        screenshots,
+    )
 
-    return _build_finding(llm_data, gathered_evidence_paths, file_excerpts, missing_information)
+    return _build_finding(
+        llm_data,
+        gathered_evidence_paths,
+        file_excerpts,
+        missing_information,
+        primary_stem,
+        project_graph,
+    )
 
 
 def _build_finding(
@@ -222,6 +285,8 @@ def _build_finding(
     gathered_evidence_paths: set[str],
     file_excerpts: dict[str, str],
     missing_information: list[str],
+    primary_stem: str,
+    project_graph: dict[str, AppConfig],
 ) -> RCAFinding:
     missing = list(missing_information)
 
@@ -233,18 +298,48 @@ def _build_finding(
             missing_information=missing,
         )
 
+    target_app = str(llm_data.get("target_app") or primary_stem)
+    if target_app not in project_graph:
+        missing.append(
+            f"Model named target_app '{target_app}', which is not in the project graph; using primary '{primary_stem}'."
+        )
+        target_app = primary_stem
+
+    # Grounding: a cited file must either be part of the pre-gathered evidence
+    # or genuinely exist inside one of the repositories the agent could search.
+    # Existence is checked on disk, so a real file the agent found by grepping
+    # is kept, while an invented path is still dropped.
     raw_files = llm_data.get("suspected_files") or []
-    verified_files = [f for f in raw_files if isinstance(f, str) and f in gathered_evidence_paths]
-    dropped_files = [f for f in raw_files if f not in verified_files]
+    verified_files: list[str] = []
+    verified_paths: list[Path] = []
+    dropped_files: list[str] = []
+    for f in raw_files:
+        if not isinstance(f, str) or not f.strip():
+            continue
+        relative = f.split("::", 1)[1] if "::" in f else f
+        if _evidence_id(target_app, relative) in gathered_evidence_paths:
+            verified_files.append(relative)
+            resolved = _resolve_in_repos(relative, target_app, project_graph)
+            if resolved:
+                verified_paths.append(resolved)
+            continue
+        resolved = _resolve_in_repos(relative, target_app, project_graph)
+        if resolved is not None:
+            verified_files.append(relative)
+            verified_paths.append(resolved)
+        else:
+            dropped_files.append(f)
     for dropped in dropped_files:
-        missing.append(f"Model referenced file '{dropped}', which was not found in the gathered evidence; dropped.")
+        missing.append(f"Model referenced file '{dropped}', which does not exist in any configured repository; dropped.")
 
     searched_text = "\n".join(file_excerpts.values())
+    if verified_paths:
+        searched_text += "\n" + _read_for_verification(verified_paths)
     raw_methods = llm_data.get("suspected_methods") or []
-    verified_methods = [m for m in raw_methods if isinstance(m, str) and m and m in searched_text]
+    verified_methods = [m for m in raw_methods if _method_in_text(m, searched_text)]
     dropped_methods = [m for m in raw_methods if m not in verified_methods]
     for dropped in dropped_methods:
-        missing.append(f"Model referenced method/function '{dropped}', which was not found in any read file; dropped.")
+        missing.append(f"Model referenced method/function '{dropped}', which was not found in any cited file; dropped.")
 
     confidence = _clamp_confidence(llm_data.get("confidence"))
     if dropped_files or dropped_methods:
@@ -261,7 +356,57 @@ def _build_finding(
         confidence=confidence,
         suggested_fix=str(llm_data.get("suggested_fix") or ""),
         missing_information=missing,
+        target_app=target_app,
     )
+
+
+def _method_in_text(method: Any, text: str) -> bool:
+    """A method may be cited as `Class.method`; the source only contains `method`."""
+    if not isinstance(method, str) or not method.strip():
+        return False
+    if method in text:
+        return True
+    name = method.split("(", 1)[0].rstrip().rsplit(".", 1)[-1]
+    return bool(name) and name in text
+
+
+def _resolve_in_repos(
+    relative_path: str,
+    target_app: str,
+    project_graph: dict[str, AppConfig],
+) -> Optional[Path]:
+    """Return the absolute path of `relative_path` if it exists inside a configured repo."""
+    ordered = [target_app, *(k for k in project_graph if k != target_app)]
+    for key in ordered:
+        cfg = project_graph.get(key)
+        if cfg is None:
+            continue
+        root = cfg.clone_path
+        if not root.is_dir():
+            continue
+        try:
+            candidate = ensure_within(root / relative_path, root)
+        except PathSecurityError:
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _read_for_verification(paths: list[Path], max_bytes: int = _MAX_VERIFY_BYTES) -> str:
+    """Read cited files so suspected_methods can be checked against their real text."""
+    chunks: list[str] = []
+    budget = max_bytes
+    for path in paths:
+        if budget <= 0:
+            break
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:budget]
+        except OSError:
+            continue
+        budget -= len(text)
+        chunks.append(text)
+    return redact("\n".join(chunks))
 
 
 def _clamp_confidence(value: Any) -> float:
@@ -327,37 +472,43 @@ def search_repository(
     matches: list[RepoMatch] = []
     files_scanned = 0
 
-    for path in sorted(root.rglob("*")):
+    skip_dirs = {".git", "build", ".gradle", ".idea", "node_modules", "captures", "Pods"}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in skip_dirs]
         if files_scanned >= max_files_scanned or len(matches) >= max_matches:
             break
-        if not path.is_file() or path.suffix.lower() not in allowed_extensions:
-            continue
-        try:
-            resolved = ensure_within(path, root)
-        except PathSecurityError:
-            continue
-        try:
-            if resolved.stat().st_size > _MAX_FILE_BYTES_SCANNED:
+        for filename in filenames:
+            path = Path(dirpath) / filename
+            if files_scanned >= max_files_scanned or len(matches) >= max_matches:
+                break
+            if path.suffix.lower() not in allowed_extensions:
                 continue
-        except OSError:
-            continue
+            try:
+                resolved = ensure_within(path, root)
+            except PathSecurityError:
+                continue
+            try:
+                if resolved.stat().st_size > _MAX_FILE_BYTES_SCANNED:
+                    continue
+            except OSError:
+                continue
 
-        files_scanned += 1
-        try:
-            with resolved.open("r", encoding="utf-8", errors="replace") as handle:
-                for line_number, line in enumerate(handle, start=1):
-                    if query_lower in line.lower():
-                        matches.append(
-                            RepoMatch(
-                                file_path=str(resolved.relative_to(root)),
-                                line_number=line_number,
-                                line_text=redact(line.strip()[:_MAX_LINE_LENGTH]),
+            files_scanned += 1
+            try:
+                with resolved.open("r", encoding="utf-8", errors="replace") as handle:
+                    for line_number, line in enumerate(handle, start=1):
+                        if query_lower in line.lower():
+                            matches.append(
+                                RepoMatch(
+                                    file_path=str(resolved.relative_to(root)),
+                                    line_number=line_number,
+                                    line_text=redact(line.strip()[:_MAX_LINE_LENGTH]),
+                                )
                             )
-                        )
-                        if len(matches) >= max_matches:
-                            break
-        except OSError:
-            continue
+                            if len(matches) >= max_matches:
+                                break
+            except OSError:
+                continue
 
     return matches
 
@@ -487,16 +638,25 @@ def _evidence_images(qa_finding: dict[str, Any]) -> list[Path]:
 
 
 def _ask_llm_for_root_cause(
-    app_config: AppConfig,
+    primary_stem: str,
+    project_graph: dict[str, AppConfig],
     qa_finding: dict[str, Any],
     logs_result: DeviceLogsResult,
     search_hits: list[RepoMatch],
-    diff_result: GitDiffResult,
+    diff_by_repo: dict[str, GitDiffResult],
     file_excerpts: dict[str, str],
     screenshots: list[Path],
 ) -> Optional[dict[str, Any]]:
+    primary_config = project_graph.get(primary_stem) or next(iter(project_graph.values()))
+    repo_list = ", ".join(f"{k} ({v.clone_path})" for k, v in project_graph.items())
+    figma_lines = figma_context_lines(primary_config)
     sections = [
-        f"App: {app_config.name} ({app_config.platform})",
+        f"Primary app under test: {primary_config.name} ({primary_config.platform}), config key '{primary_stem}'",
+        f"Repositories in scope: {repo_list}",
+    ]
+    if figma_lines:
+        sections.append("Figma design references:\n" + "\n".join(figma_lines))
+    sections += [
         f"Flow: {qa_finding.get('flow_name')}",
         f"QA failure type: {qa_finding.get('failure_type')}",
         f"QA description: {qa_finding.get('description')}",
@@ -511,18 +671,21 @@ def _ask_llm_for_root_cause(
         sections.append(f"Device logs: unavailable ({logs_result.error})")
 
     if search_hits:
-        hit_lines = "\n".join(f"{hit.file_path}:{hit.line_number}: {hit.line_text}" for hit in search_hits)
+        hit_lines = "\n".join(
+            f"{hit.repo_app}:{hit.file_path}:{hit.line_number}: {hit.line_text}" for hit in search_hits
+        )
         sections.append(f"Repository search hits:\n{hit_lines}")
     else:
         sections.append("Repository search hits: none found")
 
-    if diff_result.success:
-        sections.append(
-            f"Recently changed files: {', '.join(diff_result.changed_files) or 'none'}\n"
-            f"Diff (truncated):\n{diff_result.diff_text}"
-        )
-    else:
-        sections.append(f"Git history: unavailable ({diff_result.error})")
+    for repo_app, diff_result in diff_by_repo.items():
+        if diff_result.success:
+            sections.append(
+                f"Repo '{repo_app}' recently changed files: {', '.join(diff_result.changed_files) or 'none'}\n"
+                f"Diff (truncated):\n{diff_result.diff_text}"
+            )
+        else:
+            sections.append(f"Repo '{repo_app}' git history: unavailable ({diff_result.error})")
 
     if file_excerpts:
         excerpt_blocks = "\n\n".join(f"--- {path} ---\n{text}" for path, text in file_excerpts.items())
@@ -530,20 +693,42 @@ def _ask_llm_for_root_cause(
 
     evidence_block = "\n\n".join(sections)
 
+    repo_roots = "\n".join(f"- {key}: {cfg.clone_path}" for key, cfg in project_graph.items())
     prompt = (
-        "You are a root-cause-analysis assistant for a mobile QA pipeline. Use ONLY the evidence below - "
-        "never invent a file name, stack trace, or function name that does not literally appear in it. "
-        "If the evidence is insufficient to identify a root cause, say so explicitly and set confidence to 0.\n\n"
+        "You are a root-cause-analysis assistant for a mobile QA pipeline.\n\n"
+        "You have read-only tools (grep, glob, ls, read, semantic search) over these checked-out "
+        f"repositories:\n{repo_roots}\n\n"
+        "Investigate the failure in the source code before answering. Do not stop at the pre-gathered "
+        "keyword hits below - they are only a starting point and are often shallow (for example they may "
+        "match a strings resource rather than the screen that renders the UI). Work from the user-visible "
+        "symptom to the code: search for the feature/screen name, the components it renders, the state "
+        "that drives them, and the styling/theme that maps state to appearance. Open the files you find "
+        "and read enough of them to judge the cause.\n\n"
+        "Rules: only cite files you actually opened, and only cite functions/classes you actually saw in "
+        "them. Never guess a path. If, after searching, you still cannot locate the relevant code, say so "
+        "and set confidence to 0.\n\n"
         f"{evidence_block}\n\n"
         "Respond with ONLY a JSON object with these keys: "
-        '"root_cause_hypothesis" (string), "suspected_files" (array of strings, each copied verbatim from '
-        'the evidence above), "suspected_methods" (array of strings, each copied verbatim from the evidence '
-        'above), "supporting_evidence" (array of short strings quoting the evidence), '
+        f'"target_app" (string, one of: {", ".join(project_graph.keys())} — the repo that needs the fix), '
+        '"root_cause_hypothesis" (string), "suspected_files" (array of strings, repo-relative paths you '
+        'opened), "suspected_methods" (array of strings: function, class, or composable names you saw in '
+        'those files), "supporting_evidence" (array of short strings quoting what you read), '
         '"confidence" (number from 0 to 1), "suggested_fix" (string, a high-level description only, no code), '
         '"missing_information" (array of strings describing what would help confirm this).'
     )
 
-    result = ask_for_json(prompt, images=screenshots or None)
+    result = ask_for_json(
+        prompt,
+        images=screenshots or None,
+        cwd=primary_config.clone_path,
+        timeout=_RCA_AGENT_TIMEOUT,
+        tools=_RCA_AGENT_TOOLS,
+        # Screenshots live outside the checkouts; without their directory the
+        # agent cannot open the evidence images referenced in the prompt.
+        dirs=[cfg.clone_path for cfg in project_graph.values()]
+        + [shot.parent for shot in screenshots],
+    )
     if not result.success or not isinstance(result.data, dict):
+        print(f"[rca_agent] analysis unavailable: {result.error}", flush=True)
         return None
     return result.data

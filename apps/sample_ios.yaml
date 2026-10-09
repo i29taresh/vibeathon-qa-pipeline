@@ -7,6 +7,7 @@ repo: "your-org/sample-ios-app"
 # "../" keeps the checkout outside this orchestrator repo - required by
 # graph.ensure_source_isolated (real mode refuses to run otherwise).
 clone_path: "../workspace/sample-ios-app"
+base_branch: "main"
 flows_dir: "flows/sample-ios-app"
 reference_dir: "references/sample-ios-app"
 

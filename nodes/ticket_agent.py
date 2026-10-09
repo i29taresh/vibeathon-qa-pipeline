@@ -30,9 +30,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from config import AppConfig
+from config import AppConfig, uses_jira_integration
 from state import PipelineState, log_node
+from utils import jira as jira_api
 from utils.github import check_auth, comment_on_issue, create_issue
+from utils.jira import parse_issue_key
 
 
 def ticket_agent(state: PipelineState) -> dict:
@@ -87,7 +89,18 @@ def _run_real(state: PipelineState) -> dict:
     if skip_reason:
         return _finalize_skip(skip_reason, existing_ticket_id, attempt_count)
 
-    is_retry = bool(existing_ticket_id)
+    jira_issue_input = bool(state.get("jira_issue_input"))
+    if jira_issue_input and attempt_count == 0:
+        reason = (
+            f"Pipeline started from existing Jira issue {existing_ticket_id} - "
+            "skipping duplicate issue creation."
+        )
+        return _finalize_skip(reason, existing_ticket_id, attempt_count)
+
+    if jira_issue_input:
+        is_retry = attempt_count > 0 and bool(existing_ticket_id)
+    else:
+        is_retry = bool(existing_ticket_id)
     severity = _derive_severity(qa_finding)
     title = _build_title(app_config, qa_finding, severity)
     body = (
@@ -101,6 +114,11 @@ def _run_real(state: PipelineState) -> dict:
         return _finalize_dry_run(title, body, attachments, existing_ticket_id, attempt_count, is_retry)
 
     cwd = app_config.clone_path if app_config.clone_path.is_dir() else Path.cwd()
+
+    if uses_jira_integration(app_config):
+        return _publish_jira(
+            app_config, title, body, attachments, existing_ticket_id, attempt_count, is_retry, state
+        )
 
     auth_status = check_auth(app_config.repo, cwd)
     if not auth_status.authenticated:
@@ -142,6 +160,96 @@ def _run_real(state: PipelineState) -> dict:
         "ticket_finding": {
             "repo": app_config.repo,
             "issue_number": result.number,
+            "issue_url": ticket_url,
+            "created": not is_retry,
+            "dry_run": False,
+            "title": title,
+            "body": body,
+        },
+        "execution_history": [history],
+    }
+
+
+def _publish_jira(
+    app_config: AppConfig,
+    title: str,
+    body: str,
+    attachments: list[Path],
+    existing_ticket_id: Optional[str],
+    attempt_count: int,
+    is_retry: bool,
+    state: PipelineState,
+) -> dict:
+    jira = app_config.integrations.jira
+    assert jira is not None
+    cwd = app_config.clone_path if app_config.clone_path.is_dir() else Path.cwd()
+    auth_status = jira_api.check_auth(jira.base_url, jira.project_key, cwd=cwd)
+    if not auth_status.authenticated:
+        return _finalize_failure(
+            f"Jira is not authenticated: {auth_status.error}",
+            title,
+            body,
+            attachments,
+            existing_ticket_id,
+            attempt_count,
+        )
+    if auth_status.can_write is False:
+        return _finalize_failure(
+            f"Jira token lacks access to project '{jira.project_key}' ({auth_status.detail}).",
+            title,
+            body,
+            attachments,
+            existing_ticket_id,
+            attempt_count,
+        )
+
+    if is_retry:
+        issue_key = parse_issue_key(str(existing_ticket_id)) or str(existing_ticket_id)
+        if not issue_key:
+            return _finalize_failure(
+                f"Existing ticket_id {existing_ticket_id!r} is not a valid Jira issue key.",
+                title,
+                body,
+                attachments,
+                existing_ticket_id,
+                attempt_count,
+            )
+        result = jira_api.comment_on_issue(issue_key, body, cwd=cwd, attachments=attachments)
+    else:
+        result = jira_api.create_issue(
+            jira.base_url,
+            jira.project_key,
+            title,
+            body,
+            issue_type=jira.issue_type,
+            cwd=cwd,
+            attachments=attachments,
+        )
+
+    if not result.success:
+        return _finalize_failure(
+            result.error or "Jira API call failed.",
+            title,
+            body,
+            attachments,
+            existing_ticket_id,
+            attempt_count,
+        )
+
+    ticket_id = result.key or existing_ticket_id
+    ticket_url = result.url or state.get("ticket_url")
+    status = "ticket_ready"
+    detail = f"{'Updated' if is_retry else 'Filed new'} Jira issue {ticket_id} ({ticket_url})."
+    history = log_node("ticket_agent", status, attempt_count, detail=detail)
+    return {
+        "ticket_id": ticket_id,
+        "ticket_url": ticket_url,
+        "status": status,
+        "last_error": None,
+        "ticket_finding": {
+            "tracker": "jira",
+            "project_key": jira.project_key,
+            "issue_key": ticket_id,
             "issue_url": ticket_url,
             "created": not is_retry,
             "dry_run": False,
@@ -294,6 +402,10 @@ def _build_issue_body(
         "",
         "## Root Cause Analysis",
     ]
+
+    target_app = rca_finding.get("target_app")
+    if target_app:
+        lines += ["", f"**Fix target repository:** `{target_app}`"]
 
     if rca_finding:
         suspected_files = rca_finding.get("suspected_files") or []

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import nodes.dev_agent as dev_agent_mod
 from config import load_app_config
-from nodes.dev_agent import dev_agent
+from nodes.dev_agent import ClaudeCodeResult, dev_agent
 from state import initial_state
 from utils.github import IssueResult
 from utils.platform import PlatformResult
@@ -69,26 +69,26 @@ class _GitScript:
     create logic behaves like a real repo without touching one.
     """
 
-    def __init__(self, current_branch="main", existing_branches=("main",), claude_response=None, claude_ok=True):
+    def __init__(
+        self,
+        current_branch="main",
+        existing_branches=("main",),
+        agent_summary="Fixed the bug.",
+        agent_ok=True,
+        pre_existing_status="",
+    ):
         self.current_branch = current_branch
         self.branches = set(existing_branches)
-        self.claude_response = claude_response if claude_response is not None else {"result": "Fixed the bug."}
-        self.claude_ok = claude_ok
+        self.pre_existing_status = pre_existing_status
+        self.agent_summary = agent_summary
+        self.agent_ok = agent_ok
         self.committed = False
-        self.claude_invoked = False
+        self.agent_invoked = False
         self.calls: list[list[str]] = []
         self.porcelain_status = " M app/LoginActivity.kt\n"
 
     def __call__(self, argv, cwd, timeout=120.0, env=None):
         self.calls.append(list(argv))
-
-        if argv[0] == "claude":
-            self.claude_invoked = True
-            if not self.claude_ok:
-                return CommandResult(argv=argv, returncode=1, stdout="", stderr="claude: not authenticated")
-            import json as _json
-
-            return CommandResult(argv=argv, returncode=0, stdout=_json.dumps(self.claude_response), stderr="")
 
         if argv[:2] == ["git", "rev-parse"] and "--abbrev-ref" in argv:
             return CommandResult(argv=argv, returncode=0, stdout=self.current_branch + "\n", stderr="")
@@ -99,12 +99,13 @@ class _GitScript:
             return CommandResult(argv=argv, returncode=0 if ok else 1, stdout="", stderr="" if ok else "not found")
 
         if argv[:2] == ["git", "status"]:
-            # Before Claude Code has run, the tree is clean; after it runs
-            # (and until we commit), it shows whatever this test configured.
-            if self.committed or not self.claude_invoked:
-                status = ""
+            # Before Claude Code has run, only pre-existing local changes are
+            # present; after it runs (and until we commit), the tree also
+            # shows whatever this test configured.
+            if self.committed or not self.agent_invoked:
+                status = self.pre_existing_status
             else:
-                status = self.porcelain_status
+                status = self.pre_existing_status + self.porcelain_status
             return CommandResult(argv=argv, returncode=0, stdout=status, stderr="")
 
         if argv[:2] == ["git", "checkout"] and "-b" in argv:
@@ -130,6 +131,16 @@ class _GitScript:
         return CommandResult(argv=argv, returncode=0, stdout="", stderr="")
 
 
+def _patch_coding_agent(monkeypatch, script: _GitScript):
+    def fake_invoke(app_config, prompt, timeout=1800.0):
+        script.agent_invoked = True
+        if not script.agent_ok:
+            return ClaudeCodeResult(success=False, error="Cursor agent not authenticated")
+        return ClaudeCodeResult(success=True, summary=script.agent_summary)
+
+    monkeypatch.setattr(dev_agent_mod, "_invoke_claude_code", fake_invoke)
+
+
 def _patch_issue_and_build(monkeypatch, build_success=True, build_error=None):
     monkeypatch.setattr(
         dev_agent_mod, "get_issue", lambda repo, number, cwd: IssueResult(success=False, error="not fetched in this test")
@@ -148,7 +159,7 @@ def _patch_issue_and_build(monkeypatch, build_success=True, build_error=None):
 def test_applies_fix_builds_and_runs_tests(tmp_path, monkeypatch):
     cfg = _make_repo(tmp_path)
     cfg.build.test_command = "./gradlew test"
-    script = _GitScript(claude_response={"result": "Added a null check and a regression test."})
+    script = _GitScript(agent_summary="Added a null check and a regression test.")
 
     def fake_run_command(argv, cwd, timeout=120.0, env=None):
         if argv[:1] == ["./gradlew"] or (argv and "gradlew" in argv[0]):
@@ -156,6 +167,7 @@ def test_applies_fix_builds_and_runs_tests(tmp_path, monkeypatch):
         return script(argv, cwd, timeout, env)
 
     monkeypatch.setattr(dev_agent_mod, "run_command", fake_run_command)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg))
@@ -173,10 +185,53 @@ def test_applies_fix_builds_and_runs_tests(tmp_path, monkeypatch):
     assert finding["tests"]["success"] is True
 
 
+def test_pre_existing_local_changes_stay_out_of_the_fix(tmp_path, monkeypatch):
+    cfg = _make_repo(tmp_path)
+    script = _GitScript(pre_existing_status="?? docs/rca/\n M gradle/libs.versions.toml\n")
+    monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
+    _patch_issue_and_build(monkeypatch)
+
+    update = dev_agent(_real_state(cfg))
+
+    # A dirty checkout no longer blocks cutting the fix branch off the base.
+    assert ["git", "checkout", "-b", "ai-fix/42", "main"] in script.calls
+    assert update["status"] == "fix_applied"
+
+    finding = update["dev_finding"]
+    assert finding["files_changed"] == ["M app/LoginActivity.kt"]
+    assert finding["excluded_local_changes"] == ["docs/rca/", "gradle/libs.versions.toml"]
+
+    add_calls = [c for c in script.calls if c[:2] == ["git", "add"]]
+    assert add_calls == [["git", "add", "--", "app/LoginActivity.kt"]]
+
+
+def test_resumed_attempt_still_commits_its_own_earlier_edits(tmp_path, monkeypatch):
+    """Work the approval gate left uncommitted is the fix's, not a stray change."""
+    cfg = _make_repo(tmp_path)
+    script = _GitScript(
+        current_branch="ai-fix/42",
+        existing_branches=("main", "ai-fix/42"),
+        pre_existing_status=" M app/LoginActivity.kt\n?? docs/rca/\n",
+    )
+    monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
+    _patch_issue_and_build(monkeypatch)
+
+    state = _real_state(cfg, attempt_count=1)
+    state["dev_finding"] = {"files_changed": ["M app/LoginActivity.kt"]}
+    update = dev_agent(state)
+
+    finding = update["dev_finding"]
+    assert "M app/LoginActivity.kt" in finding["files_changed"]
+    assert finding["excluded_local_changes"] == ["docs/rca/"]
+
+
 def test_reuses_existing_fix_branch_on_retry(tmp_path, monkeypatch):
     cfg = _make_repo(tmp_path)
     script = _GitScript(current_branch="ai-fix/42", existing_branches=("main", "ai-fix/42"))
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg, attempt_count=1))
@@ -188,42 +243,42 @@ def test_reuses_existing_fix_branch_on_retry(tmp_path, monkeypatch):
     assert update["dev_finding"]["branch"] == "ai-fix/42"
 
 
-def test_never_passes_dangerous_permission_bypass(tmp_path, monkeypatch):
+def test_coding_agent_prompt_forbids_git(tmp_path, monkeypatch):
     cfg = _make_repo(tmp_path)
     script = _GitScript()
+    captured_prompt = {}
+
+    def fake_invoke(app_config, prompt, timeout=1800.0):
+        captured_prompt["text"] = prompt
+        script.agent_invoked = True
+        return ClaudeCodeResult(success=True, summary="Fixed")
+
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    monkeypatch.setattr(dev_agent_mod, "_invoke_claude_code", fake_invoke)
     _patch_issue_and_build(monkeypatch)
 
     dev_agent(_real_state(cfg))
 
-    claude_calls = [c for c in script.calls if c[0] == "claude"]
-    assert len(claude_calls) == 1
-    argv = claude_calls[0]
-    assert "--dangerously-skip-permissions" not in argv
-    assert "--add-dir" not in argv
-    assert "--permission-mode" in argv
-    assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
-    assert "--allowedTools" in argv
-    allowed = argv[argv.index("--allowedTools") + 1]
-    assert "Bash" not in allowed
+    assert "do not run git" in captured_prompt["text"].lower()
 
 
-def test_invokes_claude_with_cwd_scoped_to_clone_path(tmp_path, monkeypatch):
+def test_invokes_cursor_agent_scoped_to_clone_path(tmp_path, monkeypatch):
     cfg = _make_repo(tmp_path)
     script = _GitScript()
-    captured_cwd = {}
+    captured = {}
 
-    def fake_run_command(argv, cwd, timeout=120.0, env=None):
-        if argv and argv[0] == "claude":
-            captured_cwd["cwd"] = cwd
-        return script(argv, cwd, timeout, env)
+    def fake_invoke(app_config, prompt, timeout=1800.0):
+        captured["cwd"] = app_config.clone_path
+        script.agent_invoked = True
+        return ClaudeCodeResult(success=True, summary="Fixed")
 
-    monkeypatch.setattr(dev_agent_mod, "run_command", fake_run_command)
+    monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    monkeypatch.setattr(dev_agent_mod, "_invoke_claude_code", fake_invoke)
     _patch_issue_and_build(monkeypatch)
 
     dev_agent(_real_state(cfg))
 
-    assert captured_cwd["cwd"] == cfg.clone_path
+    assert captured["cwd"] == cfg.clone_path
 
 
 # --------------------------------------------------------------------------
@@ -235,6 +290,7 @@ def test_skips_tests_when_no_test_command_configured(tmp_path, monkeypatch):
     cfg.build.test_command = None
     script = _GitScript()
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg))
@@ -254,6 +310,7 @@ def test_build_failure_is_structured_and_distinct_from_dev_failed(tmp_path, monk
     cfg = _make_repo(tmp_path)
     script = _GitScript()
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch, build_success=False, build_error="Compilation failed: unresolved reference")
 
     update = dev_agent(_real_state(cfg))
@@ -274,6 +331,7 @@ def test_requires_approval_for_deleted_file(tmp_path, monkeypatch):
     script = _GitScript()
     script.porcelain_status = " D app/OldHelper.kt\n"
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg))
@@ -291,6 +349,7 @@ def test_requires_approval_for_ci_workflow_change(tmp_path, monkeypatch):
     script = _GitScript()
     script.porcelain_status = " M .github/workflows/ci.yml\n"
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg))
@@ -304,6 +363,7 @@ def test_requires_approval_for_secret_looking_file(tmp_path, monkeypatch):
     script = _GitScript()
     script.porcelain_status = " M .env.production\n"
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg))
@@ -317,6 +377,7 @@ def test_proceeds_past_risky_change_when_explicitly_approved(tmp_path, monkeypat
     script = _GitScript()
     script.porcelain_status = " D app/OldHelper.kt\n"
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg, approve_destructive_changes=True))
@@ -332,8 +393,9 @@ def test_proceeds_past_risky_change_when_explicitly_approved(tmp_path, monkeypat
 
 def test_claude_code_failure_is_reported_without_crashing(tmp_path, monkeypatch):
     cfg = _make_repo(tmp_path)
-    script = _GitScript(claude_ok=False)
+    script = _GitScript(agent_ok=False)
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg))
@@ -348,6 +410,7 @@ def test_no_changes_from_claude_is_reported_distinctly(tmp_path, monkeypatch):
     script = _GitScript()
     script.porcelain_status = ""  # nothing changed
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg))
@@ -378,6 +441,35 @@ def test_missing_git_repo_blocks_without_incrementing_attempt_count(tmp_path):
     assert "attempt_count" not in update
 
 
+def test_configured_develop_is_the_base_branch(tmp_path, monkeypatch):
+    cfg = _make_repo(tmp_path)
+    cfg.base_branch = "develop"
+    script = _GitScript(current_branch="develop", existing_branches=("develop",))
+    monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
+    _patch_issue_and_build(monkeypatch)
+
+    update = dev_agent(_real_state(cfg))
+
+    assert update["status"] == "fix_applied"
+    assert update["dev_finding"]["base_branch"] == "develop"
+    assert ["git", "checkout", "-b", "ai-fix/42", "develop"] in script.calls
+
+
+def test_fix_branch_starts_from_origin_when_local_base_is_missing(tmp_path, monkeypatch):
+    cfg = _make_repo(tmp_path)
+    cfg.base_branch = "develop"
+    script = _GitScript(current_branch="feature", existing_branches=("feature", "origin/develop"))
+    monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
+    _patch_issue_and_build(monkeypatch)
+
+    update = dev_agent(_real_state(cfg))
+
+    assert update["dev_finding"]["base_branch"] == "develop"
+    assert ["git", "checkout", "-b", "ai-fix/42", "origin/develop"] in script.calls
+
+
 def test_no_base_branch_blocks_cleanly(tmp_path, monkeypatch):
     cfg = _make_repo(tmp_path)
     script = _GitScript(existing_branches=())  # neither main nor master exists
@@ -397,6 +489,7 @@ def test_works_for_ios_config(tmp_path, monkeypatch):
     cfg = _make_repo(tmp_path, app_name="sample_ios")
     script = _GitScript()
     monkeypatch.setattr(dev_agent_mod, "run_command", script)
+    _patch_coding_agent(monkeypatch, script)
     _patch_issue_and_build(monkeypatch)
 
     update = dev_agent(_real_state(cfg))

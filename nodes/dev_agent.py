@@ -42,15 +42,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from config import AppConfig
+from config import AppConfig, uses_jira_integration
 from state import PipelineState, log_node
 from utils.github import get_issue
+from utils import jira as jira_api
+from utils.project_context import resolve_fix_app_config
 from utils.platform import build_app
+from utils.cursor_agent import extract_json_object, run_agent_prompt
 from utils.runner import CommandResult, RunnerError, run_command
 from utils.secrets import redact
 
 _ALLOWED_TOOLS = "Read,Edit,Write,Glob,Grep"
-_BASE_BRANCH_CANDIDATES = ("main", "master")
+# Used only in error text when the configured branch is missing.
+_FALLBACK_NOTE = "Set base_branch in the app config to a branch that exists in the checkout."
 _CI_PATTERNS = (".github/workflows/", ".gitlab-ci", "jenkinsfile", ".circleci/", "azure-pipelines", ".travis.yml")
 _SECURITY_PATTERNS = ("codeowners",)
 _SECRET_PATTERNS = (".env", ".pem", ".key", "secret", "credential")
@@ -104,29 +108,47 @@ def _run_mock(state: PipelineState) -> dict:
 
 def _run_real(state: PipelineState) -> dict:
     app_config: AppConfig = state["app_config"]
+    target_stem, fix_config = resolve_fix_app_config(state)
     qa_finding = state.get("qa_finding") or {}
     rca_finding = state.get("rca_finding") or {}
     ticket_id = state.get("ticket_id")
-    root = app_config.clone_path
+    root = fix_config.clone_path
 
-    print(f"\n[dev_agent] Preparing fix for '{app_config.name}' ({app_config.platform})...")
+    print(
+        f"\n[dev_agent] Preparing fix for '{fix_config.name}' ({fix_config.platform}) "
+        f"[target_app={target_stem}]..."
+    )
 
-    precheck_error = _precheck(app_config, ticket_id)
+    precheck_error = _precheck(fix_config, ticket_id)
     if precheck_error:
         return _finalize_blocked(state, precheck_error)
 
-    base_branch = _detect_base_branch(root)
-    if base_branch is None:
-        return _finalize_blocked(state, f"Could not determine a valid base branch (tried {_BASE_BRANCH_CANDIDATES}).")
+    resolved = _detect_base_branch(root, fix_config.base_branch)
+    if resolved is None:
+        return _finalize_blocked(
+            state,
+            f"Configured base branch '{fix_config.base_branch}' was not found in {root}. {_FALLBACK_NOTE}",
+        )
+    base_branch, start_point = resolved
 
     branch_name = f"ai-fix/{ticket_id}"
-    branch_result = _ensure_fix_branch(root, branch_name, base_branch)
+    branch_result = _ensure_fix_branch(root, branch_name, start_point)
     if not branch_result.success:
         return _finalize_blocked(state, branch_result.error or "Could not prepare the fix branch.")
 
+    # Snapshot what was already dirty, before the coding agent touches
+    # anything, so pre-existing local work is never mistaken for the fix.
+    previous_files = (state.get("dev_finding") or {}).get("files_changed") or []
+    baseline_changes = _baseline_changes(root, previous_files)
+    if baseline_changes:
+        print(
+            f"[dev_agent] {len(baseline_changes)} pre-existing local change(s) will be "
+            f"left out of the fix commit: {', '.join(sorted(baseline_changes)[:5])}"
+        )
+
     issue_body = _fetch_issue_context(app_config, ticket_id, root)
     task_prompt = _build_task_prompt(qa_finding, rca_finding, issue_body)
-    claude_result = _invoke_claude_code(app_config, task_prompt)
+    claude_result = _invoke_claude_code(fix_config, task_prompt)
 
     # Claude Code ran (or at least was invoked) - a genuine attempt was made,
     # distinct from the precheck/branch failures above which never got this far.
@@ -141,7 +163,7 @@ def _run_real(state: PipelineState) -> dict:
             claude_result.error,
         )
 
-    changed_files = _git_changed_files(root)
+    changed_files = _git_changed_files(root, exclude=baseline_changes)
     if not changed_files:
         detail = "Claude Code made no changes to the repository."
         return _finalize(
@@ -179,11 +201,17 @@ def _run_real(state: PipelineState) -> dict:
             None,
         )
 
-    commit_result = _commit_changes(root, f"ai-fix: attempt #{attempt_count} for {branch_name}")
+    commit_result = _commit_changes(
+        root,
+        f"ai-fix: attempt #{attempt_count} for {branch_name}",
+        [path for _, path in changed_files],
+    )
     base_dev_finding = {
         "branch": branch_name,
         "base_branch": base_branch,
+        "target_app": target_stem,
         "files_changed": files_changed_display,
+        "excluded_local_changes": sorted(baseline_changes),
         "requires_approval": bool(risk_flags),
         "risk_flags": risk_flags,
         "claude_summary": claude_result.summary,
@@ -194,7 +222,7 @@ def _run_real(state: PipelineState) -> dict:
 
     base_dev_finding["diff_summary"] = _diff_summary(root)
 
-    build_result = build_app(app_config)
+    build_result = build_app(fix_config)
     if not build_result.success:
         return _finalize(
             "dev_build_failed",
@@ -204,7 +232,7 @@ def _run_real(state: PipelineState) -> dict:
             build_result.error,
         )
 
-    test_result = _run_tests(app_config)
+    test_result = _run_tests(fix_config)
     dev_finding = {
         **base_dev_finding,
         "build": {
@@ -264,10 +292,18 @@ def _precheck(app_config: AppConfig, ticket_id: Optional[str]) -> Optional[str]:
     return None
 
 
-def _detect_base_branch(root: Path) -> Optional[str]:
-    for candidate in _BASE_BRANCH_CANDIDATES:
-        if _run_git(["git", "rev-parse", "--verify", "--quiet", candidate], root, timeout=15.0).ok:
-            return candidate
+def _detect_base_branch(root: Path, configured: str) -> Optional[tuple[str, str]]:
+    """Return (merge-request target, git start point) for the configured base branch.
+
+    A local branch is preferred. If only ``origin/<name>`` exists, the fix
+    branch is created from that remote ref and the MR still targets the short name.
+    """
+    name = configured.strip()
+    if _run_git(["git", "rev-parse", "--verify", "--quiet", name], root, timeout=15.0).ok:
+        return name, name
+    remote_ref = f"origin/{name}"
+    if _run_git(["git", "rev-parse", "--verify", "--quiet", remote_ref], root, timeout=15.0).ok:
+        return name, remote_ref
     return None
 
 
@@ -281,21 +317,15 @@ def _ensure_fix_branch(root: Path, branch_name: str, base_branch: str) -> Branch
 
     If we're already on `branch_name` (resuming a prior attempt), any
     pending uncommitted changes from that attempt are left alone - this is
-    what makes multiple fix attempts on the same branch possible. We only
-    require a *clean* tree when switching away from some other branch,
-    so we never carry unrelated uncommitted state onto the fix branch.
+    what makes multiple fix attempts on the same branch possible.
+
+    A dirty working tree does not block the switch. Local changes that
+    predate this node are recorded as a baseline by the caller and excluded
+    at commit time, so unrelated state is carried along by git but never
+    becomes part of the fix.
     """
     if _current_branch(root) == branch_name:
         return BranchResult(success=True, reused=True)
-
-    status_result = _run_git(["git", "status", "--porcelain"], root)
-    if not status_result.ok:
-        return BranchResult(success=False, error=redact(status_result.stderr.strip() or "git status failed"))
-    if status_result.stdout.strip():
-        return BranchResult(
-            success=False,
-            error="Working tree has unrelated uncommitted changes before switching to the fix branch.",
-        )
 
     if _run_git(["git", "rev-parse", "--verify", "--quiet", branch_name], root, timeout=15.0).ok:
         checkout_result = _run_git(["git", "checkout", branch_name], root)
@@ -309,16 +339,45 @@ def _ensure_fix_branch(root: Path, branch_name: str, base_branch: str) -> Branch
     return BranchResult(success=True, reused=False)
 
 
-def _git_changed_files(root: Path) -> list[tuple[str, str]]:
+def _porcelain_path(field: str) -> str:
+    """Normalize one `git status --porcelain` path field."""
+    path = field.strip()
+    if " -> " in path:  # rename/copy - the destination is what we stage
+        path = path.split(" -> ", 1)[1].strip()
+    if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+        path = path[1:-1]
+    return path
+
+
+def _git_changed_files(root: Path, exclude: Optional[set[str]] = None) -> list[tuple[str, str]]:
     result = _run_git(["git", "status", "--porcelain"], root)
     if not result.ok:
         return []
+    skip = exclude or set()
     changed = []
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
-        changed.append((line[:2].strip(), line[3:].strip()))
+        path = _porcelain_path(line[3:])
+        if path in skip:
+            continue
+        changed.append((line[:2].strip(), path))
     return changed
+
+
+def _baseline_changes(root: Path, previous_files: list[str]) -> set[str]:
+    """Paths already dirty before this attempt - they are not part of the fix.
+
+    A previous attempt's own uncommitted work (what the approval gate leaves
+    behind) is kept out of the baseline, so a resumed and approved attempt
+    still commits its earlier edits.
+    """
+    ours = set()
+    for entry in previous_files:
+        parts = str(entry).split(" ", 1)
+        if len(parts) == 2:
+            ours.add(parts[1].strip())
+    return {path for _, path in _git_changed_files(root) if path not in ours}
 
 
 def _classify_risk(changed_files: list[tuple[str, str]]) -> list[str]:
@@ -337,8 +396,17 @@ def _classify_risk(changed_files: list[tuple[str, str]]) -> list[str]:
     return flags
 
 
-def _commit_changes(root: Path, message: str) -> CommandResult:
-    _run_git(["git", "add", "-A"], root)
+def _commit_changes(root: Path, message: str, paths: list[str]) -> CommandResult:
+    """Stage only the fix's own paths.
+
+    Never `git add -A`: that would sweep in whatever unrelated local changes
+    happened to be sitting in the checkout.
+    """
+    if not paths:
+        return CommandResult(argv=["git", "commit"], returncode=1, stdout="", stderr="No fix changes to commit.")
+    add_result = _run_git(["git", "add", "--", *paths], root)
+    if not add_result.ok:
+        return add_result
     return _run_git(["git", "commit", "-m", message], root)
 
 
@@ -353,6 +421,12 @@ def _diff_summary(root: Path, max_chars: int = _MAX_DIFF_CHARS) -> str:
 def _fetch_issue_context(app_config: AppConfig, ticket_id: Optional[str], cwd: Path) -> str:
     if not ticket_id:
         return ""
+    if uses_jira_integration(app_config):
+        issue_result = jira_api.get_issue(str(ticket_id), cwd=cwd)
+        if not issue_result.success or not issue_result.raw_body:
+            return ""
+        return redact(issue_result.raw_body[:8000])
+
     try:
         issue_number = int(ticket_id)
     except (TypeError, ValueError):
@@ -418,38 +492,28 @@ def _build_task_prompt(qa_finding: dict[str, Any], rca_finding: dict[str, Any], 
 
 
 def _invoke_claude_code(app_config: AppConfig, prompt: str, timeout: float = 1800.0) -> ClaudeCodeResult:
-    """Run the Claude Code CLI headlessly, scoped to app_config.clone_path.
+    """Run a local Cursor agent (CURSOR_API_KEY) scoped to app_config.clone_path.
 
-    `-p` makes this non-interactive (prints the final result, then exits).
-    `--permission-mode acceptEdits` auto-approves edits *within*
-    `--allowedTools` only - never `--dangerously-skip-permissions`. No
-    `--add-dir` is passed, so Claude Code's own sandboxing keeps file access
-    inside `cwd` (app_config.clone_path).
+    The agent may edit files under cwd via Cursor's local runtime. This node
+    still owns git commit, build, and test — the agent must not push or merge.
     """
-    argv = [
-        "claude", "-p", prompt,
-        "--output-format", "json",
-        "--permission-mode", "acceptEdits",
-        "--allowedTools", _ALLOWED_TOOLS,
-    ]
-    try:
-        result = run_command(argv, cwd=app_config.clone_path, timeout=timeout)
-    except RunnerError as exc:
-        return ClaudeCodeResult(success=False, error=str(exc))
+    task = (
+        redact(prompt)
+        + "\n\nConstraints: only edit files under this project directory; do not run git; "
+        "add or update a regression test for the fix."
+    )
+    ok, raw_text, err = run_agent_prompt(task, app_config.clone_path, timeout=timeout)
+    if not ok:
+        return ClaudeCodeResult(success=False, error=err or "Cursor agent failed")
 
-    if not result.ok:
-        return ClaudeCodeResult(success=False, error=redact(result.stderr.strip() or "claude exited non-zero"))
+    data, _ = extract_json_object(raw_text)
+    if data:
+        summary = redact(str(data.get("result") or data.get("summary") or "")).strip()
+        if summary:
+            return ClaudeCodeResult(success=True, summary=summary[:2000], raw_stdout=redact(raw_text))
 
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        # Different CLI builds/versions may not emit identical JSON shapes -
-        # fall back to the raw (redacted, bounded) stdout as the summary
-        # rather than treating this as a hard failure.
-        return ClaudeCodeResult(success=True, summary=redact(result.stdout.strip())[:2000], raw_stdout=redact(result.stdout))
-
-    summary = redact(str(data.get("result") or data.get("summary") or "")).strip()
-    return ClaudeCodeResult(success=True, summary=summary, raw_stdout=redact(result.stdout))
+    summary = redact(raw_text.strip())[:2000]
+    return ClaudeCodeResult(success=True, summary=summary, raw_stdout=redact(raw_text))
 
 
 # --------------------------------------------------------------------------

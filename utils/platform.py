@@ -148,12 +148,17 @@ def _select_ios_device(app_config: AppConfig, timeout: float) -> PlatformResult:
 # Log capture
 # --------------------------------------------------------------------------
 
-def capture_logs(app_config: AppConfig, device_id: str, timeout: float = 60.0) -> PlatformResult:
-    """Dump the current device log buffer for `device_id`."""
+def capture_logs(
+    app_config: AppConfig,
+    device_id: str,
+    timeout: float = 20.0,
+    max_lines: int = 400,
+) -> PlatformResult:
+    """Dump a bounded slice of the device log buffer for `device_id`."""
     cwd = app_config.clone_path if app_config.clone_path.is_dir() else Path.cwd()
 
     if app_config.platform == "android":
-        argv = ["adb", "-s", device_id, "logcat", "-d"]
+        argv = ["adb", "-s", device_id, "logcat", "-d", "-t", str(max_lines)]
     else:
         argv = ["xcrun", "simctl", "spawn", device_id, "log", "show", "--style", "compact", "--last", "2m"]
 

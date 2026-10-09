@@ -13,10 +13,15 @@ import os
 import re
 
 _SECRET_ENV_VARS = (
+    "CURSOR_API_KEY",
     "ANTHROPIC_API_KEY",
     "GITHUB_TOKEN",
     "GH_TOKEN",
     "OPENAI_API_KEY",
+    "GITLAB_TOKEN",
+    "GITLAB_PRIVATE_TOKEN",
+    "GITLAB_API_ACCESSTOKEN",
+    "JIRA_API_TOKEN",
 )
 
 # Common token *shapes*, redacted even if they didn't come from one of the
@@ -26,6 +31,7 @@ _SECRET_PATTERNS = [
     re.compile(r"ghp_[A-Za-z0-9]{10,}"),
     re.compile(r"gho_[A-Za-z0-9]{10,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{10,}"),
+    re.compile(r"glpat-[A-Za-z0-9\-_]{10,}"),
 ]
 
 REDACTED = "***REDACTED***"

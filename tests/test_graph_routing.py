@@ -10,8 +10,27 @@ from pathlib import Path
 import pytest
 
 from config import load_app_config
-from graph import PipelineSafetyError, _route_after_qa, _route_after_retest, ensure_source_isolated, run_pipeline
+from graph import (
+    PipelineSafetyError,
+    _route_after_qa,
+    _route_after_retest,
+    _route_from_start,
+    ensure_source_isolated,
+    run_pipeline,
+)
 from state import initial_state
+
+
+# --------------------------------------------------------------------------
+# _route_from_start
+# --------------------------------------------------------------------------
+
+def test_route_from_start_defaults_to_qa_agent():
+    assert _route_from_start({}) == "qa_agent"
+
+
+def test_route_from_start_with_jira_key_goes_to_intake():
+    assert _route_from_start({"jira_issue_key": "B2B-123"}) == "jira_intake"
 
 
 # --------------------------------------------------------------------------
@@ -67,6 +86,17 @@ def test_route_after_retest_infrastructure_failure_is_blocked_even_with_retries_
 def test_route_after_retest_functional_failure_within_budget_retries():
     state = {"passed": False, "status": "retest_failed", "qa_finding": {"failure_type": "functional"}}
     assert _route_after_retest(state) == "retry"
+
+
+def test_route_after_retest_stops_when_attempt_budget_exhausted():
+    state = {
+        "passed": False,
+        "status": "retest_failed",
+        "qa_finding": {"failure_type": "functional"},
+        "attempt_count": 3,
+        "max_attempts": 3,
+    }
+    assert _route_after_retest(state) == "stop"
 
 
 # --------------------------------------------------------------------------

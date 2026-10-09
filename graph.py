@@ -1,11 +1,11 @@
 """LangGraph wiring for the QA pipeline.
 
-    START -> qa_agent
+    START -> qa_agent  OR  (when state["jira_issue_key"] is set) -> jira_intake_agent -> rca_agent
                |-- passes                                  --> END (status=no_bugs_found, set by qa_agent)
                |-- confirmed defect (functional/visual)     --> rca_agent -> ticket_agent -> dev_agent -> retest_agent
                '-- unverified/infrastructure (real mode)    --> END, blocked - no ticket filed
 
-    retest_agent -->
+    retest_agent (Maestro + Jira baseline verification when jira_issue_input) -->
                |-- passes                                   --> merge_step -> END (opens a PR, never merges)
                |-- infrastructure failure (real mode)        --> END, blocked
                |-- confirmed failure, attempts remaining     --> rca_agent (loop)
@@ -28,17 +28,21 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+ProgressCallback = Callable[["PipelineState", float], None]
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from nodes.dev_agent import dev_agent
+from nodes.jira_intake_agent import jira_intake_agent
 from nodes.merge_step import merge_step
 from nodes.qa_agent import qa_agent
 from nodes.rca_agent import rca_agent
 from nodes.retest_agent import retest_agent
 from nodes.ticket_agent import ticket_agent
+from config import collect_clone_paths
 from state import PipelineState
 
 # This file's own directory is the orchestration repo's root - the one
@@ -56,6 +60,11 @@ class PipelineSafetyError(Exception):
     """Raised when running the pipeline would be unsafe to even start."""
 
 
+def ensure_all_sources_isolated(clone_paths: list[Path]) -> None:
+    for path in clone_paths:
+        ensure_source_isolated(path)
+
+
 def ensure_source_isolated(clone_path: Path) -> None:
     """Refuse to proceed if `clone_path` overlaps this orchestrator's own repository.
 
@@ -71,6 +80,12 @@ def ensure_source_isolated(clone_path: Path) -> None:
             f"({ORCHESTRATOR_ROOT}) - refusing to run. Point clone_path at an isolated checkout "
             "of the target application instead."
         )
+
+
+def _route_from_start(state: PipelineState) -> str:
+    if state.get("jira_issue_key"):
+        return "jira_intake"
+    return "qa_agent"
 
 
 def _route_after_qa(state: PipelineState) -> str:
@@ -98,6 +113,11 @@ def _route_after_retest(state: PipelineState) -> str:
     if state.get("status") == "needs_human_review":
         return "stop"
 
+    attempt_count = state.get("attempt_count", 0)
+    max_attempts = state.get("max_attempts", 3)
+    if attempt_count >= max_attempts:
+        return "stop"
+
     return "retry"
 
 
@@ -106,13 +126,17 @@ def build_graph() -> CompiledStateGraph:
     graph = StateGraph(PipelineState)
 
     graph.add_node("qa_agent", qa_agent)
+    graph.add_node("jira_intake_agent", jira_intake_agent)
     graph.add_node("rca_agent", rca_agent)
     graph.add_node("ticket_agent", ticket_agent)
     graph.add_node("dev_agent", dev_agent)
     graph.add_node("retest_agent", retest_agent)
     graph.add_node("merge_step", merge_step)
 
-    graph.add_edge(START, "qa_agent")
+    graph.add_conditional_edges(
+        START, _route_from_start, {"jira_intake": "jira_intake_agent", "qa_agent": "qa_agent"}
+    )
+    graph.add_edge("jira_intake_agent", "rca_agent")
     graph.add_conditional_edges(
         "qa_agent", _route_after_qa, {"end": END, "blocked": END, "rca_agent": "rca_agent"}
     )
@@ -129,7 +153,11 @@ def build_graph() -> CompiledStateGraph:
     return graph.compile()
 
 
-def run_pipeline(state: PipelineState, timeout: Optional[float] = None) -> PipelineState:
+def run_pipeline(
+    state: PipelineState,
+    timeout: Optional[float] = None,
+    on_progress: ProgressCallback | None = None,
+) -> PipelineState:
     """Run the compiled graph to completion and return the final state.
 
     `timeout` (seconds) bounds total wall-clock execution, falling back to
@@ -140,21 +168,26 @@ def run_pipeline(state: PipelineState, timeout: Optional[float] = None) -> Pipel
     gathered up to that point are preserved rather than discarded.
     """
     if state.get("mode") == "real":
-        app_config = state.get("app_config")
-        if app_config is not None:
-            ensure_source_isolated(app_config.clone_path)
+        project_graph = state.get("project_graph")
+        if project_graph:
+            ensure_all_sources_isolated(collect_clone_paths(project_graph))
+        else:
+            app_config = state.get("app_config")
+            if app_config is not None:
+                ensure_source_isolated(app_config.clone_path)
 
     pipeline = build_graph()
 
     timeout_value = timeout if timeout is not None else state.get("timeout_seconds")
-    if timeout_value is None:
-        return pipeline.invoke(state)
-
-    deadline = time.monotonic() + timeout_value
+    started = time.monotonic()
+    deadline = started + timeout_value if timeout_value is not None else None
     last_state: PipelineState = state
+
     for snapshot in pipeline.stream(state, stream_mode="values"):
         last_state = snapshot
-        if time.monotonic() > deadline:
+        if on_progress:
+            on_progress(last_state, time.monotonic() - started)
+        if deadline is not None and time.monotonic() > deadline:
             timed_out = dict(last_state)
             timed_out["status"] = "pipeline_timeout"
             timed_out["last_error"] = f"Pipeline exceeded the configured timeout of {timeout_value}s."

@@ -36,6 +36,7 @@ from config import AppConfig
 from mock_scenarios import retest_passes
 from state import PipelineState, log_node
 from utils.platform import build_app, install_app, select_device
+from utils.jira_verification import jira_failure_finding, verify_against_jira_baseline
 from utils.qa_validation import QAFinding, infrastructure_finding, run_qa_check
 
 
@@ -129,17 +130,64 @@ def _run_real(state: PipelineState) -> dict:
     regression_findings = [run_qa_check(app_config, name) for name in app_config.regression_flows]
     failed_regressions = [f for f in regression_findings if not f.passed]
 
-    # Steps 7-8: confirm the original defect is resolved and no new regression appeared.
-    if primary_finding.passed and not failed_regressions:
-        return _finalize_success(primary_finding, regression_findings, attempt_count, build_install_info)
+    jira_verification_info: dict[str, Any] | None = None
+    jira_result = None
+    jira_baseline = state.get("jira_baseline")
+    if state.get("jira_issue_input") and jira_baseline:
+        jira_result = verify_against_jira_baseline(
+            app_config,
+            jira_baseline,
+            primary_finding.evidence_paths,
+            flow_name,
+        )
+        jira_verification_info = {
+            "passed": jira_result.passed,
+            "issue_resolved": jira_result.issue_resolved,
+            "description": jira_result.description,
+            "expected_behavior": jira_result.expected_behavior,
+            "actual_behavior": jira_result.actual_behavior,
+            "confidence": jira_result.confidence,
+            "error": jira_result.error,
+        }
+        print(
+            f"[retest_agent] Jira verification for {jira_baseline.get('issue_key')}: "
+            f"{'resolved' if jira_result.passed else 'not resolved'} "
+            f"(confidence={jira_result.confidence:.2f})."
+        )
 
-    # Something is still failing. Focus the next RCA pass on whichever
-    # finding actually represents the open problem: if the original flow
-    # still fails, that's still the priority; otherwise it's the first new
-    # regression (the original fix is fine, something else broke).
-    focus_finding = primary_finding if not primary_finding.passed else failed_regressions[0]
+    maestro_ok = primary_finding.passed and not failed_regressions
+    jira_ok = jira_verification_info is None or bool(jira_verification_info.get("passed"))
+
+    # Steps 7-8: Maestro + (when applicable) Jira report must both be satisfied.
+    if maestro_ok and jira_ok:
+        return _finalize_success(
+            primary_finding,
+            regression_findings,
+            attempt_count,
+            build_install_info,
+            jira_verification=jira_verification_info,
+        )
+
+    # Something is still failing. Priority: Maestro primary, regression, then Jira-only failure.
+    if not primary_finding.passed:
+        focus_finding = primary_finding
+    elif failed_regressions:
+        focus_finding = failed_regressions[0]
+    elif jira_result is not None and not jira_ok:
+        focus_finding = jira_failure_finding(flow_name, jira_baseline, jira_result)
+        # Merge retest screenshots into evidence for RCA
+        focus_finding.evidence_paths = list(dict.fromkeys(primary_finding.evidence_paths + focus_finding.evidence_paths))
+    else:
+        focus_finding = primary_finding
+
     return _finalize_failure(
-        focus_finding, regression_findings, attempt_count, max_attempts, build_install_info, primary_finding=primary_finding
+        focus_finding,
+        regression_findings,
+        attempt_count,
+        max_attempts,
+        build_install_info,
+        primary_finding=primary_finding,
+        jira_verification=jira_verification_info,
     )
 
 
@@ -159,6 +207,7 @@ def _finalize_success(
     regression_findings: list[QAFinding],
     attempt_count: int,
     build_install_info: dict[str, Any],
+    jira_verification: dict[str, Any] | None = None,
 ) -> dict:
     evidence_paths = list(primary_finding.evidence_paths)
     for finding in regression_findings:
@@ -169,11 +218,18 @@ def _finalize_success(
         "regression_results": [asdict(f) for f in regression_findings],
         "original_defect_resolved": True,
         "new_regressions": [],
+        "jira_verification": jira_verification,
         **build_install_info,
     }
 
     status = "retest_passed"
-    detail = f"Retest passed: original defect resolved; {len(regression_findings)} regression flow(s) all passed."
+    jira_note = ""
+    if jira_verification:
+        jira_note = " Jira report verification passed."
+    detail = (
+        f"Retest passed: original defect resolved; {len(regression_findings)} regression flow(s) all passed."
+        f"{jira_note}"
+    )
     history = log_node("retest_agent", status, attempt_count, detail=detail)
 
     return {
@@ -193,6 +249,7 @@ def _finalize_failure(
     max_attempts: int,
     build_install_info: dict[str, Any],
     primary_finding: Optional[QAFinding] = None,
+    jira_verification: dict[str, Any] | None = None,
 ) -> dict:
     evidence_paths = list(focus_finding.evidence_paths)
     for finding in regression_findings:
@@ -204,6 +261,7 @@ def _finalize_failure(
         "regression_results": [asdict(f) for f in regression_findings],
         "original_defect_resolved": bool(primary_finding and primary_finding.passed),
         "new_regressions": [f.flow_name for f in regression_findings if not f.passed],
+        "jira_verification": jira_verification,
         **build_install_info,
     }
 

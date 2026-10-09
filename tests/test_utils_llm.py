@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import anthropic
-
 from utils.llm import ask_for_json, get_client
 
 
@@ -74,8 +72,12 @@ def test_ask_for_json_non_object_json():
     assert "not an object" in result.error
 
 
+class _APITimeoutError(Exception):
+    pass
+
+
 def test_ask_for_json_timeout():
-    client = _FakeClient.with_error(anthropic.APITimeoutError(request=None))
+    client = _FakeClient.with_error(_APITimeoutError("timed out"))
 
     result = ask_for_json("analyze this", client=client)
 
@@ -84,7 +86,7 @@ def test_ask_for_json_timeout():
 
 
 def test_ask_for_json_api_error():
-    client = _FakeClient.with_error(anthropic.AnthropicError("boom"))
+    client = _FakeClient.with_error(RuntimeError("boom"))
 
     result = ask_for_json("analyze this", client=client)
 

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from config import AppConfig
+from config import AppConfig, figma_context_lines
 from utils.llm import ask_for_json
 from utils.maestro import MaestroResult, run_flow
 from utils.paths import PathSecurityError, ensure_within
@@ -223,10 +223,16 @@ def analyze_with_llm(
     if not references.criteria_text or not maestro_result.screenshots:
         return None
 
+    figma_block = ""
+    figma_lines = figma_context_lines(app_config)
+    if figma_lines:
+        figma_block = "Figma design references (for visual context only):\n" + "\n".join(figma_lines) + "\n\n"
+
     prompt = (
         "You are a QA analyst comparing an app's actual behavior against written acceptance criteria.\n"
         f"App: {app_config.name} ({app_config.platform})\n"
         f"Flow: {flow_name}\n\n"
+        f"{figma_block}"
         f"Acceptance criteria:\n{references.criteria_text}\n\n"
         f"The automated test assertions {'passed' if functional_passed else 'FAILED'} for this run.\n"
         "Compare the attached actual screenshot(s) against the acceptance criteria (and any reference "
@@ -237,7 +243,8 @@ def analyze_with_llm(
     )
 
     images = [*references.expected_screenshots, *maestro_result.screenshots]
-    result = ask_for_json(prompt, images=images)
+    workdir = images[0].parent if images else app_config.clone_path
+    result = ask_for_json(prompt, images=images, cwd=workdir)
     if not result.success or not isinstance(result.data, dict):
         return None
     return result.data

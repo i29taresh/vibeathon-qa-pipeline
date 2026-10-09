@@ -11,7 +11,8 @@
 
 name: ""              # Application name, e.g. "my-shopping-app"
 platform: ""          # "android" or "ios"
-repo: ""              # GitHub "owner/repository"
+repo: ""              # Remote path, e.g. "group/subgroup/my-app" (GitLab) or "owner/repo" (GitHub)
+base_branch: "develop"  # Branch ai-fix/* is created from, and the merge-request target.
 clone_path: ""        # Local source checkout dir, relative to the project root.
                        # MUST resolve outside this orchestrator repo (e.g. "../workspace/<app>") -
                        # real mode refuses to run otherwise (graph.ensure_source_isolated).
@@ -22,6 +23,23 @@ reference_dir: ""     # Expected/reference UI screenshots dir, relative to the p
 # regression suite after a fix, in addition to the originally failing flow.
 # Leave empty if there's nothing to configure yet.
 regression_flows: []  # e.g. ["smoke_test.yaml", "checkout_flow.yaml"]
+
+# Optional integrations (dashboard-editable). When jira/gitlab are set, real-mode
+# ticket_agent and merge_step use them instead of GitHub Issues / gh pr.
+integrations:
+  gitlab:
+    host: ""           # e.g. "gitlab.example.com"
+    project_path: ""   # e.g. "group/subgroup/my-app"
+  jira:
+    base_url: ""       # e.g. "https://your-org.atlassian.net"
+    project_key: ""
+    issue_type: "Bug"
+  figma:
+    file_url: ""
+    frame_urls: []     # URLs injected into QA/RCA prompts as design context
+
+# Other apps this project depends on (each must have apps/<name>.yaml).
+dependencies: []      # e.g. [{ app: "shared-lib", relationship: "library" }]
 
 device:
   # Android emulator configuration. Required when platform: android.

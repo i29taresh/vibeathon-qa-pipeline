@@ -18,10 +18,10 @@ import shutil
 import sys
 from pathlib import Path
 
-from config import AppConfig, ConfigError, load_app_config
-from graph import PipelineSafetyError, ensure_source_isolated, run_pipeline
+from config import AppConfig, ConfigError, load_app_config, load_project_graph
+from graph import PipelineSafetyError, ensure_all_sources_isolated, ensure_source_isolated, run_pipeline
 from mock_scenarios import SCENARIOS
-from state import VALID_MODES, initial_state
+from state import VALID_MODES, create_pipeline_state
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -43,6 +43,12 @@ def main(argv: list[str] | None = None) -> int:
         "--flow",
         default="default_flow",
         help="Flow filename to run - only used with --mode real (default: default_flow).",
+    )
+    parser.add_argument(
+        "--jira-issue",
+        default=None,
+        metavar="KEY",
+        help="Real mode: start from an existing Jira issue (downloads attachments/video frames) instead of Maestro QA.",
     )
     parser.add_argument(
         "--dry-run",
@@ -75,24 +81,32 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.preflight:
-        return _run_preflight(app_config)
+        return _run_preflight(app_config, app_stem=args.app)
 
+    if args.jira_issue and args.mode != "real":
+        print("Config error: --jira-issue requires --mode real.", file=sys.stderr)
+        return 1
+
+    project_graph = None
     if args.mode == "real":
         try:
-            ensure_source_isolated(app_config.clone_path)
-        except PipelineSafetyError as exc:
+            project_graph = load_project_graph(args.app)
+            ensure_all_sources_isolated([c.clone_path for c in project_graph.values()])
+        except (ConfigError, PipelineSafetyError) as exc:
             print(f"Safety error: {exc}", file=sys.stderr)
             return 1
 
-    state = initial_state(
+    state = create_pipeline_state(
         app_name=args.app,
         app_config=app_config,
         mode=args.mode,
         mock_scenario=args.mock_scenario,
         flow_name=args.flow,
+        jira_issue_raw=args.jira_issue,
         max_attempts=args.max_attempts,
         dry_run=args.dry_run,
         timeout_seconds=args.timeout,
+        project_graph=project_graph,
     )
 
     banner = f"=== Running pipeline for '{args.app}' ({app_config.platform}) | mode={args.mode}"
@@ -137,11 +151,14 @@ def _print_summary(final_state: dict) -> None:
 # Preflight (real mode only; never builds, installs, edits, or pushes)
 # --------------------------------------------------------------------------
 
-_REQUIRED_BINARIES = ("gh", "claude", "maestro")
+_REQUIRED_BINARIES = ("gh", "maestro")
 _CRITERIA_FILENAMES = ("acceptance_criteria.md", "acceptance_criteria.txt", "criteria.md", "criteria.txt")
 
 
-def _run_preflight(app_config: AppConfig) -> int:
+def _run_preflight(app_config: AppConfig, app_stem: str | None = None) -> int:
+    from config import uses_gitlab_integration, uses_jira_integration
+    from utils import gitlab as gitlab_api
+    from utils import jira as jira_api
     from utils.github import check_auth
     from utils.platform import select_device
 
@@ -149,24 +166,83 @@ def _run_preflight(app_config: AppConfig) -> int:
 
     checks: list[dict] = []
 
-    try:
-        ensure_source_isolated(app_config.clone_path)
-        checks.append(_check("Source isolation", True, True, f"clone_path is outside this orchestrator's repo"))
-    except PipelineSafetyError as exc:
-        checks.append(_check("Source isolation", True, False, str(exc)))
+    project_graph = None
+    if app_stem:
+        try:
+            project_graph = load_project_graph(app_stem)
+        except ConfigError as exc:
+            checks.append(_check("Dependency graph", True, False, str(exc)))
+
+    clone_paths = [c.clone_path for c in project_graph.values()] if project_graph else [app_config.clone_path]
+    isolation_ok = True
+    isolation_detail = []
+    for path in clone_paths:
+        try:
+            ensure_source_isolated(path)
+            isolation_detail.append(f"{path}: ok")
+        except PipelineSafetyError as exc:
+            isolation_ok = False
+            isolation_detail.append(str(exc))
+    checks.append(
+        _check(
+            "Source isolation",
+            True,
+            isolation_ok,
+            "; ".join(isolation_detail) if isolation_detail else "clone paths outside orchestrator",
+        )
+    )
 
     platform_binary = "adb" if app_config.platform == "android" else "xcrun"
     for binary in (*_REQUIRED_BINARIES, platform_binary):
         found = shutil.which(binary) is not None
         checks.append(_check(f"Dependency: {binary}", True, found, "found on PATH" if found else "NOT FOUND on PATH"))
 
+    from utils.cursor_agent import cursor_api_key
+
+    key_set = bool(cursor_api_key())
+    checks.append(
+        _check(
+            "CURSOR_API_KEY",
+            True,
+            key_set,
+            "set in environment" if key_set else "NOT SET — required for RCA/QA LLM and dev_agent",
+        )
+    )
+    try:
+        import cursor_sdk  # noqa: F401
+
+        checks.append(_check("cursor-sdk package", True, True, "installed"))
+    except ImportError:
+        checks.append(_check("cursor-sdk package", True, False, "run: pip install cursor-sdk"))
+
     cwd = app_config.clone_path if app_config.clone_path.is_dir() else Path.cwd()
-    auth = check_auth(app_config.repo, cwd)
-    checks.append(_check("GitHub authentication", True, auth.authenticated, auth.error or "authenticated"))
-    if auth.authenticated:
-        write_ok = auth.can_write is not False
-        detail = auth.detail or ("permission undetermined" if auth.can_write is None else "")
-        checks.append(_check(f"GitHub write access to '{app_config.repo}'", True, write_ok, detail))
+    if uses_jira_integration(app_config):
+        jira = app_config.integrations.jira
+        assert jira is not None
+        auth = jira_api.check_auth(jira.base_url, jira.project_key, cwd=cwd)
+        checks.append(_check("Jira authentication", True, auth.authenticated, auth.error or auth.detail or "ok"))
+        if auth.authenticated:
+            write_ok = auth.can_write is not False
+            checks.append(
+                _check(f"Jira project '{jira.project_key}'", True, write_ok, auth.detail or "")
+            )
+    else:
+        auth = check_auth(app_config.repo, cwd)
+        checks.append(_check("GitHub authentication", True, auth.authenticated, auth.error or "authenticated"))
+        if auth.authenticated:
+            write_ok = auth.can_write is not False
+            detail = auth.detail or ("permission undetermined" if auth.can_write is None else "")
+            checks.append(_check(f"GitHub write access to '{app_config.repo}'", True, write_ok, detail))
+
+    if uses_gitlab_integration(app_config):
+        from config import gitlab_project_for
+
+        host, project_path = gitlab_project_for(app_config)
+        gl_auth = gitlab_api.check_auth(host, project_path, cwd=cwd)
+        checks.append(_check("GitLab authentication", True, gl_auth.authenticated, gl_auth.error or gl_auth.detail))
+        if gl_auth.authenticated:
+            write_ok = gl_auth.can_write is not False
+            checks.append(_check(f"GitLab project '{project_path}'", True, write_ok, gl_auth.detail or ""))
 
     device_result = select_device(app_config)
     detail = device_result.error if not device_result.success else f"device_id={device_result.details.get('device_id')}"

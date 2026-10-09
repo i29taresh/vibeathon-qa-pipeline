@@ -1,0 +1,27 @@
+# Shared library consumed by b2b-android via GitLab Maven (local clone for RCA/fixes).
+name: "payzyshared"
+platform: "android"
+repo: "allios/touchpoint/android/payzyshared"
+clone_path: "/Users/tareshshrma/StudioProjects/payzyshared"
+base_branch: "develop"
+flows_dir: "flows/payzyshared"
+reference_dir: "references/payzyshared"
+
+integrations:
+  gitlab:
+    host: "gitlab.cosmotepayments.gr"
+    project_path: "allios/touchpoint/android/payzyshared"
+
+device:
+  android:
+    avd_name: "pixel_7_api_34"
+    api_level: 34
+
+build:
+  android:
+    module: ":app"
+    build_command: "./gradlew publishToMavenLocal"
+    artifact_path: "build/libs/placeholder.jar"
+    install_command: "true"
+    package_id: "gr.payzy.shared"
+    test_command: "./gradlew test"

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from config import ConfigError, load_app_config
+from config import ConfigError, load_app_config, validate_dependencies_for
 
 VALID_ANDROID_YAML = textwrap.dedent(
     """\
@@ -72,6 +72,23 @@ def _write_app(root: Path, app_name: str, content: str) -> None:
     (apps_dir / f"{app_name}.yaml").write_text(content)
 
 
+def test_flows_dir_falls_back_to_clone_path_when_missing_under_project(tmp_path: Path) -> None:
+    clone = tmp_path / "app-checkout"
+    flows = clone / "flows/app"
+    flows.mkdir(parents=True)
+    yaml_text = VALID_ANDROID_YAML.replace(
+        'clone_path: "workspace/test-android-app"',
+        f'clone_path: "{clone}"',
+    ).replace(
+        'flows_dir: "flows/test-android-app"',
+        'flows_dir: "flows/app"',
+    )
+    _write_app(tmp_path, "clone_flows", yaml_text)
+
+    cfg = load_app_config("clone_flows", project_root=tmp_path)
+    assert cfg.flows_dir == flows.resolve()
+
+
 def test_load_valid_android_config(tmp_path: Path) -> None:
     _write_app(tmp_path, "test_android", VALID_ANDROID_YAML)
 
@@ -88,6 +105,7 @@ def test_load_valid_android_config(tmp_path: Path) -> None:
     assert cfg.app_id == "com.example.testapp"
     assert cfg.build.test_command is None  # optional field, not set in VALID_ANDROID_YAML
     assert cfg.regression_flows == []  # optional field, defaults to empty
+    assert cfg.base_branch == "develop"
 
 
 def test_optional_test_command_is_picked_up_when_present(tmp_path: Path) -> None:
@@ -203,8 +221,32 @@ def test_invalid_repo_format(tmp_path: Path) -> None:
     )
     _write_app(tmp_path, "bad_repo", broken)
 
-    with pytest.raises(ConfigError, match="owner/repository"):
+    with pytest.raises(ConfigError, match="at least one slash"):
         load_app_config("bad_repo", project_root=tmp_path)
+
+
+def test_nested_gitlab_repo_path(tmp_path: Path) -> None:
+    nested = VALID_ANDROID_YAML.replace(
+        'repo: "acme/test-android-app"',
+        'repo: "allios/touchpoint/android/b2b-android"',
+    )
+    _write_app(tmp_path, "nested_repo", nested)
+    cfg = load_app_config("nested_repo", project_root=tmp_path)
+    assert cfg.repo == "allios/touchpoint/android/b2b-android"
+
+
+def test_dependency_cycle_rejected(tmp_path: Path) -> None:
+    _write_app(tmp_path, "app_a", VALID_ANDROID_YAML.replace('name: "test-android-app"', 'name: "a"'))
+    b_yaml = VALID_ANDROID_YAML.replace('name: "test-android-app"', 'name: "b"').replace(
+        'repo: "acme/test-android-app"', 'repo: "acme/b"'
+    )
+    _write_app(tmp_path, "app_b", b_yaml + '\ndependencies:\n  - app: "app_a"\n')
+    a_yaml = (tmp_path / "apps" / "app_a.yaml").read_text() + '\ndependencies:\n  - app: "app_b"\n'
+    (tmp_path / "apps" / "app_a.yaml").write_text(a_yaml)
+    with pytest.raises(ConfigError, match="cycle"):
+        validate_dependencies_for("app_a", project_root=tmp_path)
+
+
 
 
 def test_sample_android_config_loads() -> None:

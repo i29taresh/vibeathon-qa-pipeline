@@ -21,7 +21,8 @@ pip install -r requirements-dev.txt   # runtime deps + pytest
 
 | Variable | Used by | Required? |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | `utils/llm.py` (RCA/QA visual analysis) and the `claude` CLI invoked by `dev_agent` | Yes, for any real-mode run that reaches `qa_agent`'s visual check, `rca_agent`, or `dev_agent` |
+| `CURSOR_API_KEY` | `utils/llm.py` and `dev_agent` via the Cursor SDK (`cursor-sdk`, local agent runtime) | Yes, for any real-mode run that reaches `qa_agent`'s visual check, `rca_agent`, or `dev_agent` |
+| `CURSOR_MODEL` | Optional model id for Cursor agents (default: `composer-2.5`) | No |
 | `GH_TOKEN` or `GITHUB_TOKEN` | the `gh` CLI, for non-interactive auth (e.g. in CI) | Only if you haven't already run `gh auth login` interactively |
 
 Mock mode (the default) needs neither - it never calls the network, an LLM, or `gh`.
@@ -34,7 +35,7 @@ These must be installed and on `PATH`; `python main.py --app <name> --preflight`
 |---|---|
 | `git` | branch/commit/push in `dev_agent` and `merge_step` |
 | `gh` (GitHub CLI, authenticated) | issues/PRs in `ticket_agent` and `merge_step` |
-| `claude` (Claude Code CLI) | the coding engine in `dev_agent` |
+| `cursor-sdk` (Python package) | local Cursor agents for RCA/QA LLM and `dev_agent` code edits |
 | `maestro` | running UI flows in `qa_agent`/`retest_agent` |
 | `adb` (Android) or `xcrun` (iOS) | device/emulator/simulator access |
 

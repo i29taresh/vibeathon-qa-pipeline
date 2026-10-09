@@ -26,7 +26,14 @@ class ExecutionRecord(TypedDict):
 class PipelineState(TypedDict, total=False):
     app_name: str
     app_config: AppConfig
+    project_graph: dict[str, AppConfig]
     flow_name: str
+    # When set, the pipeline starts from jira_intake_agent instead of qa_agent.
+    jira_issue_key: Optional[str]
+    # True after jira_intake_agent: ticket_agent reuses the issue instead of creating one.
+    jira_issue_input: bool
+    # Original Jira report snapshot for post-fix verification in retest_agent.
+    jira_baseline: dict[str, Any]
     status: str
     passed: bool
     ticket_id: Optional[str]
@@ -96,15 +103,62 @@ class PipelineState(TypedDict, total=False):
 VALID_MODES = ("mock", "real")
 
 
+def create_pipeline_state(
+    app_name: str,
+    app_config: AppConfig,
+    *,
+    mock_scenario: Optional[str] = None,
+    mode: str = "mock",
+    flow_name: str = "default_flow",
+    jira_issue_raw: Optional[str] = None,
+    max_attempts: int = 3,
+    dry_run: bool = False,
+    timeout_seconds: Optional[float] = None,
+    project_graph: Optional[dict[str, AppConfig]] = None,
+) -> PipelineState:
+    """Build pipeline state for CLI/dashboard (parses Jira URL/key, tolerates older initial_state)."""
+    from utils.jira import normalize_issue_input
+
+    jira_issue_key: Optional[str] = None
+    if jira_issue_raw and str(jira_issue_raw).strip():
+        jira_issue_key = normalize_issue_input(str(jira_issue_raw))
+        if not jira_issue_key:
+            raise ValueError(
+                f"Could not parse a Jira issue key from {jira_issue_raw!r}. "
+                "Use KEY-123 or a browse URL like https://your.atlassian.net/browse/KEY-123."
+            )
+
+    kwargs = {
+        "app_name": app_name,
+        "app_config": app_config,
+        "mock_scenario": mock_scenario,
+        "mode": mode,
+        "flow_name": flow_name,
+        "max_attempts": max_attempts,
+        "dry_run": dry_run,
+        "timeout_seconds": timeout_seconds,
+        "project_graph": project_graph,
+    }
+    try:
+        state = initial_state(**kwargs, jira_issue_key=jira_issue_key)
+    except TypeError:
+        state = initial_state(**kwargs)
+        if jira_issue_key:
+            state["jira_issue_key"] = jira_issue_key
+    return state
+
+
 def initial_state(
     app_name: str,
     app_config: AppConfig,
     mock_scenario: Optional[str] = None,
     mode: str = "mock",
     flow_name: str = "default_flow",
+    jira_issue_key: Optional[str] = None,
     max_attempts: int = 3,
     dry_run: bool = False,
     timeout_seconds: Optional[float] = None,
+    project_graph: Optional[dict[str, AppConfig]] = None,
 ) -> PipelineState:
     """Build the starting PipelineState for one pipeline run.
 
@@ -115,10 +169,15 @@ def initial_state(
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")
 
+    graph = project_graph if project_graph is not None else {app_name: app_config}
+
     return {
         "app_name": app_name,
         "app_config": app_config,
+        "project_graph": graph,
         "flow_name": flow_name,
+        "jira_issue_key": jira_issue_key,
+        "jira_issue_input": False,
         "status": "pending",
         "passed": False,
         "ticket_id": None,

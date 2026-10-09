@@ -1,0 +1,33 @@
+name: b2b-android
+platform: android
+repo: allios/touchpoint/android/b2b-android
+clone_path: /Users/tareshshrma/StudioProjects/b2b-android
+base_branch: develop
+flows_dir: flows/b2b-android
+reference_dir: references/b2b-android
+integrations:
+  gitlab:
+    host: gitlab.cosmotepayments.gr
+    project_path: allios/touchpoint/android/b2b-android
+  jira:
+    base_url: https://alliws.atlassian.net
+    project_key: WFDR
+    issue_type: Bug
+  figma:
+    file_url: ''
+    frame_urls: []
+dependencies:
+- app: payzyshared
+  relationship: library
+device:
+  android:
+    avd_name: pixel_7_api_34
+    api_level: 34
+build:
+  android:
+    module: :app
+    build_command: ./gradlew :app:assembleGrPayzyDevDebug
+    artifact_path: app/build/outputs/apk/grPayzy/dev/debug/app-gr-payzy-dev-debug.apk
+    install_command: adb install -r {artifact_path}
+    package_id: gr.payzy.pro.dev
+    test_command: ./gradlew :app:testGrPayzyDevDebugUnitTest

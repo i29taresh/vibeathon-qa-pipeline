@@ -41,13 +41,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from config import AppConfig
+from config import AppConfig, gitlab_project_for, uses_gitlab_integration, uses_jira_integration
 from state import PipelineState, log_node
+from utils import gitlab as gitlab_api
 from utils.github import check_auth, create_pull_request, get_pull_request_for_branch
+from utils.project_context import resolve_fix_app_config
 from utils.runner import CommandResult, RunnerError, run_command
 from utils.secrets import redact
 
-_BASE_BRANCH_NAMES = ("main", "master")
+_PROTECTED_PUSH_NAMES = frozenset({"main", "master"})
 
 
 def merge_step(state: PipelineState) -> dict:
@@ -80,6 +82,7 @@ def _run_mock(state: PipelineState) -> dict:
 
 def _run_real(state: PipelineState) -> dict:
     app_config: AppConfig = state["app_config"]
+    target_stem, fix_config = resolve_fix_app_config(state)
     attempt_count = state.get("attempt_count", 0)
     dev_finding = state.get("dev_finding") or {}
     retest_finding = state.get("retest_finding") or {}
@@ -87,7 +90,10 @@ def _run_real(state: PipelineState) -> dict:
     qa_finding = state.get("qa_finding") or {}
     ticket_id = state.get("ticket_id")
 
-    print(f"\n[merge_step] Preparing PR for '{app_config.name}' ({app_config.platform})...")
+    print(
+        f"\n[merge_step] Preparing merge request for '{fix_config.name}' "
+        f"({fix_config.platform}) [target_app={target_stem}]..."
+    )
 
     existing_pr_url = state.get("pr_url")
     if existing_pr_url:
@@ -99,7 +105,7 @@ def _run_real(state: PipelineState) -> dict:
 
     branch = dev_finding["branch"]
     base_branch = dev_finding["base_branch"]
-    root = app_config.clone_path
+    root = fix_config.clone_path
 
     drift_error = _check_for_branch_drift(root, base_branch, dev_finding)
     if drift_error:
@@ -109,22 +115,37 @@ def _run_real(state: PipelineState) -> dict:
     if dirty_error:
         return _finalize_blocked(dirty_error, attempt_count)
 
-    auth_status = check_auth(app_config.repo, root)
-    if not auth_status.authenticated:
-        return _finalize_blocked(f"GitHub CLI is not authenticated: {auth_status.error}", attempt_count)
-    if auth_status.can_write is False:
-        return _finalize_blocked(
-            f"GitHub token lacks write access to '{app_config.repo}' ({auth_status.detail}).", attempt_count
-        )
+    use_gitlab = uses_gitlab_integration(fix_config)
+    if use_gitlab:
+        host, project_path = gitlab_project_for(fix_config)
+        auth_status = gitlab_api.check_auth(host, project_path, root)
+        if not auth_status.authenticated:
+            return _finalize_blocked(f"GitLab is not authenticated: {auth_status.error}", attempt_count)
+        if auth_status.can_write is False:
+            return _finalize_blocked(
+                f"GitLab token lacks write access to '{project_path}' ({auth_status.detail}).", attempt_count
+            )
+    else:
+        auth_status = check_auth(fix_config.repo, root)
+        if not auth_status.authenticated:
+            return _finalize_blocked(f"GitHub CLI is not authenticated: {auth_status.error}", attempt_count)
+        if auth_status.can_write is False:
+            return _finalize_blocked(
+                f"GitHub token lacks write access to '{fix_config.repo}' ({auth_status.detail}).", attempt_count
+            )
 
-    # Dedup via GitHub itself, in case a PR already exists for this branch
-    # from outside this process/state (e.g. a prior run that crashed after
-    # creating the PR but before saving pr_url).
-    existing = get_pull_request_for_branch(app_config.repo, branch, root)
+    if use_gitlab:
+        host, project_path = gitlab_project_for(fix_config)
+        existing = gitlab_api.get_merge_request_for_branch(host, project_path, branch, root)
+    else:
+        existing = get_pull_request_for_branch(fix_config.repo, branch, root)
     if existing.success and existing.url:
-        return _finalize_existing(existing.url, existing.number, attempt_count)
+        number = getattr(existing, "iid", None) or getattr(existing, "number", None)
+        return _finalize_existing(existing.url, number, attempt_count)
 
-    title, body = _build_pr_content(qa_finding, rca_finding, dev_finding, retest_finding, ticket_id)
+    title, body = _build_pr_content(
+        app_config, qa_finding, rca_finding, dev_finding, retest_finding, ticket_id
+    )
     dry_run = bool(state.get("dry_run", False))
 
     if dry_run:
@@ -139,32 +160,43 @@ def _run_real(state: PipelineState) -> dict:
         )
         return _finalize_blocked(reason, attempt_count)
 
-    push_error = _push_branch(root, branch)
+    push_error = _push_branch(root, branch, protected_names=frozenset({fix_config.base_branch}))
     if push_error:
         return _finalize_blocked(push_error, attempt_count)
 
     draft = bool(state.get("draft_pr", True))
-    result = create_pull_request(app_config.repo, title, body, head=branch, base=base_branch, cwd=root, draft=draft)
+    if use_gitlab:
+        host, project_path = gitlab_project_for(fix_config)
+        result = gitlab_api.create_merge_request(
+            host, project_path, title, body, source_branch=branch, target_branch=base_branch, cwd=root, draft=draft
+        )
+    else:
+        result = create_pull_request(
+            fix_config.repo, title, body, head=branch, base=base_branch, cwd=root, draft=draft
+        )
     if not result.success:
-        return _finalize_blocked(f"Could not create pull request: {result.error}", attempt_count)
+        return _finalize_blocked(f"Could not create merge request: {result.error}", attempt_count)
 
+    mr_number = getattr(result, "iid", None) or getattr(result, "number", None)
     status = "ready_for_review"
-    detail = f"Opened PR {result.url} for ticket {ticket_id} (not merged)."
+    detail = f"Opened merge request {result.url} for ticket {ticket_id} (not merged)."
     history = log_node("merge_step", status, attempt_count, detail=detail)
 
     return {
         "status": status,
         "last_error": None,
         "pr_url": result.url,
-        "pr_number": result.number,
+        "pr_number": mr_number,
         "merge_finding": {
             "pr_url": result.url,
-            "pr_number": result.number,
+            "pr_number": mr_number,
             "branch": branch,
             "base_branch": base_branch,
+            "target_app": target_stem,
             "title": title,
             "body": body,
             "draft": draft,
+            "tracker": "gitlab" if use_gitlab else "github",
         },
         "execution_history": [history],
     }
@@ -293,8 +325,9 @@ def _check_clean_tree(root: Path) -> Optional[str]:
     return None
 
 
-def _push_branch(root: Path, branch: str) -> Optional[str]:
-    if branch in _BASE_BRANCH_NAMES:
+def _push_branch(root: Path, branch: str, protected_names: frozenset[str] | None = None) -> Optional[str]:
+    blocked = _PROTECTED_PUSH_NAMES | (protected_names or frozenset())
+    if branch in blocked:
         return f"Refusing to push directly to '{branch}' - this must be a dedicated ai-fix/* branch."
 
     remote_check = _run_git(["git", "remote", "get-url", "origin"], root, timeout=15.0)
@@ -312,6 +345,7 @@ def _push_branch(root: Path, branch: str) -> Optional[str]:
 # --------------------------------------------------------------------------
 
 def _build_pr_content(
+    app_config: AppConfig,
     qa_finding: dict[str, Any],
     rca_finding: dict[str, Any],
     dev_finding: dict[str, Any],
@@ -324,7 +358,18 @@ def _build_pr_content(
 
     lines: list[str] = []
     if ticket_id:
-        lines += [f"Fixes #{ticket_id}", ""]
+        if uses_jira_integration(app_config) or "-" in str(ticket_id):
+            lines += [f"Fixes {ticket_id}", ""]
+        else:
+            lines += [f"Fixes #{ticket_id}", ""]
+    figma = app_config.integrations.figma
+    if figma and (figma.file_url or figma.frame_urls):
+        lines += ["## Design references"]
+        if figma.file_url:
+            lines.append(f"- Figma file: {figma.file_url}")
+        for url in figma.frame_urls:
+            lines.append(f"- Frame: {url}")
+        lines.append("")
 
     lines += [
         "## Root Cause",
