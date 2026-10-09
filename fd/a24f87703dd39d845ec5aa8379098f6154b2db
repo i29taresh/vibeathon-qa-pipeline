@@ -1,0 +1,84 @@
+utils/jira_intake.py
+  s_0b81107d8aa3d1::t_7a8011fcbf7606 121,131
+nodes/retest_agent.py
+  s_0b81107d8aa3d1::t_2c7b8501b0a10a 287
+  s_0b81107d8aa3d1::t_40c951f2f4d925 241
+nodes/jira_intake_agent.py
+  s_0b81107d8aa3d1::t_3e3a10dd83eec8 109
+tests/test_utils_maestro.py
+  s_0b81107d8aa3d1::t_659797dd63cea6 32
+  s_0b81107d8aa3d1::t_0c74d21280f96e 45-46
+nodes/qa_agent.py
+  s_0b81107d8aa3d1::t_72bc8a13c8e6b0 82
+utils/runner.py
+  s_0b81107d8aa3d1::t_78a91f0f00079a 96-142
+  s_0b81107d8aa3d1::t_565fcf92ce684a 21-22
+.streamlit/config.toml
+  s_0b81107d8aa3d1::t_a825c740006e1a 1-10
+utils/maestro.py
+  s_0b81107d8aa3d1::t_b26fb179e2725a 34
+  s_0b81107d8aa3d1::t_89a1eb3f9efe2d 39-41,48
+  s_0b81107d8aa3d1::t_737e4f56b8cfa2 115-134
+  s_0b81107d8aa3d1::t_d6a289a952dc10 77,81-83,87-89,98,109
+  s_0b81107d8aa3d1::t_c2eafc7a09e8d4 75-76
+  s_0b81107d8aa3d1::t_157534057984b4 86
+  s_0b81107d8aa3d1::t_ea1a64258ba832 12
+utils/platform.py
+  s_0b81107d8aa3d1::t_2ee9c16dc95ff3 230-292
+  s_0b81107d8aa3d1::t_7c1498a7bd590f 28
+utils/qa_validation.py
+  s_0b81107d8aa3d1::t_799ec4fc3a6848 48
+  s_0b81107d8aa3d1::t_861ad11ee8e6b6 89-99
+  s_0b81107d8aa3d1::t_1d0c03011ca9bc 278
+  s_0b81107d8aa3d1::t_005f1a9f46af67 110
+  s_0b81107d8aa3d1::t_e86562f2e55949 311
+  s_0b81107d8aa3d1::t_79cec74fc5a6fc 14
+  s_0b81107d8aa3d1::t_cd5b7e2d3e45b4 296
+  s_0b81107d8aa3d1::t_cfede1bc67ffb1 323
+dashboard.py
+  s_0b81107d8aa3d1::t_452e4032a06355 744,753,841
+  s_0b81107d8aa3d1::t_96e1ff2871109c 335-337,339-347,349-375,377-378,380-381
+  s_0b81107d8aa3d1::t_caaa2565ef3996 1038
+  s_0b81107d8aa3d1::t_15e7738905064d 690-710
+  s_0b81107d8aa3d1::t_19b8661e172fe0 572-591
+  s_0b81107d8aa3d1::t_f1b12fbf36764b 79-81
+  s_0b81107d8aa3d1::t_969707087aa2ef 1076
+  s_0b81107d8aa3d1::t_1c9654ce52b323 264,271,274,288,290-303
+  s_0b81107d8aa3d1::t_0ecee1b6dc777a 77-78,82-146
+  s_0b81107d8aa3d1::t_9bfca753c1aef7 1070
+  s_0b81107d8aa3d1::t_35240746f5d1ce 730-738,740-743,745-752,754-760
+  s_0b81107d8aa3d1::t_5e3f840c7ff7a7 1039-1049,1052
+  s_0b81107d8aa3d1::t_12d4132193fc90 937-1027
+  s_0b81107d8aa3d1::t_4dc93a6b0bbfa1 2
+  s_0b81107d8aa3d1::t_cf4ae1a0a7129e 273,275-287
+  s_0b81107d8aa3d1::t_ee812f57a85d72 421-462
+  s_0b81107d8aa3d1::t_b54149780a3f67 1037
+  s_0b81107d8aa3d1::t_f2ad0dea28b1f9 463-469
+  s_0b81107d8aa3d1::t_359cdc55aa1bed 769-777,779-783,785-806
+  s_0b81107d8aa3d1::t_ca95019443b0fa 6
+  s_0b81107d8aa3d1::t_765340bb4b4645 811-835
+  s_0b81107d8aa3d1::t_f8711280722858 36-40,44-48
+  s_0b81107d8aa3d1::t_8170e401522c02 41-43
+  s_0b81107d8aa3d1::t_e15c623b702a03 392-397,399-406,408-411
+  s_0b81107d8aa3d1::t_e84f5367d791cf 265-270,272,289,304-314,316-318,320-322,324-334,338,348,376,379,382,384-388,390-391,398,407,412-420,470-471,473-475,478-490,492-493,495-500
+  s_0b81107d8aa3d1::t_c4908ccdd778c4 1079
+  s_0b81107d8aa3d1::t_f8d3fe4c4bf710 223-240
+  s_0b81107d8aa3d1::t_a000fb55441351 166,196,199-200
+  s_0b81107d8aa3d1::t_7aabbd6040e3b8 157,164-165,169-172,174,176,178-179,181-183,185-195,197-198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fda24f87703dd39d845ec5aa8379098f6154b2db",
+  "prompts": {},
+  "sessions": {
+    "s_0b81107d8aa3d1": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "cc6d818e-b4a0-4568-bda4-4f180f659b3d",
+        "model": "auto-smart"
+      },
+      "human_author": "shivangsingh <shivang.singh@telekom-digital.com>"
+    }
+  }
+}
