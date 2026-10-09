@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from utils.runner import RunnerError, run_command
@@ -17,7 +17,7 @@ _FRAME_PATH_RE = re.compile(r"^(/[^\s]+\.png)\s*$", re.MULTILINE)
 @dataclass
 class FrameExtractResult:
     success: bool
-    frames: list[Path]
+    frames: list[Path] = field(default_factory=list)
     output_dir: Path | None = None
     error: str | None = None
 

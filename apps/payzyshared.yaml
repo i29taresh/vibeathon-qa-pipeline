@@ -2,7 +2,7 @@
 name: "payzyshared"
 platform: "android"
 repo: "allios/touchpoint/android/payzyshared"
-clone_path: "/Users/tareshshrma/StudioProjects/payzyshared"
+clone_path: "/Users/shivangsingh/StudioProjects/payzyshared"
 base_branch: "develop"
 flows_dir: "flows/payzyshared"
 reference_dir: "references/payzyshared"

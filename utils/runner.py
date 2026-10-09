@@ -43,6 +43,29 @@ class CommandResult:
         return self.returncode == 0 and not self.timed_out
 
 
+def _prepare_argv_env(
+    argv: list[str],
+    env: dict[str, str] | None,
+) -> tuple[list[str], dict[str, str] | None]:
+    """Resolve bare `adb`/`emulator` to SDK paths and enrich PATH when needed."""
+    if not argv:
+        return argv, env
+    tool = argv[0]
+    if tool in ("adb", "emulator", "maestro") or tool.endswith("/adb") or tool.endswith("/emulator") or tool.endswith("/maestro"):
+        from utils.android_sdk import adb_path, emulator_path, ensure_android_tools_env, maestro_path
+
+        resolved = list(argv)
+        if tool == "adb":
+            resolved[0] = adb_path()
+        elif tool == "emulator":
+            resolved[0] = emulator_path()
+        elif tool == "maestro":
+            resolved[0] = maestro_path()
+        # Maestro talks to devices via adb — keep SDK tools on PATH.
+        return resolved, ensure_android_tools_env(env)
+    return argv, env
+
+
 def run_command(
     argv: Sequence[str],
     cwd: Path,
@@ -65,6 +88,8 @@ def run_command(
     cwd = Path(cwd)
     if not cwd.is_dir():
         raise RunnerError(f"Working directory does not exist: {cwd}")
+
+    argv, env = _prepare_argv_env(argv, env)
 
     try:
         completed = subprocess.run(
@@ -110,10 +135,12 @@ def start_background(argv: Sequence[str], cwd: Path) -> subprocess.Popen:
     cwd = Path(cwd)
     if not cwd.is_dir():
         raise RunnerError(f"Working directory does not exist: {cwd}")
+    argv, env = _prepare_argv_env(argv, None)
     try:
         return subprocess.Popen(
             argv,
             cwd=cwd,
+            env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,

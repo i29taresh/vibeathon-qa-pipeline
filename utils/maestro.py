@@ -39,6 +39,34 @@ class MaestroResult:
 _VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 
 
+def _resolve_flow_path(
+    app_config: AppConfig,
+    flow_name: str,
+    flow_path: Path | str | None = None,
+) -> Path:
+    """Resolve a flow under flows_dir, or an absolute path under an allowed root.
+
+    Absolute / generated flows (e.g. ``local/runs/<TICKET>/repro.yaml``) must
+    stay inside the orchestrator repo's ``local/`` tree or the app's ``flows_dir``.
+    """
+    if flow_path is not None:
+        candidate = Path(flow_path).resolve()
+        orchestrator_root = Path(__file__).resolve().parent.parent
+        allowed_roots = [
+            app_config.flows_dir.resolve(),
+            (orchestrator_root / "local").resolve(),
+        ]
+        last_err: Exception | None = None
+        for root in allowed_roots:
+            try:
+                return ensure_within(candidate, root)
+            except PathSecurityError as exc:
+                last_err = exc
+                continue
+        raise PathSecurityError(str(last_err) if last_err else f"Flow path not allowed: {candidate}")
+    return ensure_within(app_config.flows_dir / flow_name, app_config.flows_dir)
+
+
 def run_flow(
     app_config: AppConfig,
     flow_name: str,
@@ -46,10 +74,16 @@ def run_flow(
     runs_root: Path | None = None,
     timeout: float = 600.0,
     record_screen: bool = False,
+    flow_path: Path | str | None = None,
 ) -> MaestroResult:
-    """Execute `flows_dir/<flow_name>` on `device_id` via the Maestro CLI."""
+    """Execute a Maestro flow on `device_id`.
+
+    By default runs ``flows_dir/<flow_name>``. When ``flow_path`` is set (POC
+    generated repro YAML), that absolute path is used instead if it stays
+    inside ``flows_dir`` or the orchestrator ``local/`` directory.
+    """
     try:
-        flow_path = ensure_within(app_config.flows_dir / flow_name, app_config.flows_dir)
+        flow_path = _resolve_flow_path(app_config, flow_name, flow_path=flow_path)
     except PathSecurityError as exc:
         return MaestroResult(success=False, error=str(exc))
 

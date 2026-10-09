@@ -5,7 +5,13 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-from utils.gitlab import check_auth, create_merge_request
+from utils.gitlab import check_auth, clone_url, create_merge_request
+
+
+def test_clone_url_embeds_oauth2_token():
+    url = clone_url("gitlab.example.com", "group/project", token="glpat-secret")
+    assert url.startswith("https://oauth2:glpat-secret@gitlab.example.com/")
+    assert url.endswith("/group/project.git")
 
 
 @patch("utils.gitlab._request")

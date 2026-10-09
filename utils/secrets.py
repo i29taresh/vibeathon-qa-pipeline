@@ -22,6 +22,9 @@ _SECRET_ENV_VARS = (
     "GITLAB_PRIVATE_TOKEN",
     "GITLAB_API_ACCESSTOKEN",
     "JIRA_API_TOKEN",
+    "ODS_ARTIFACTORY_PASSWORD",
+    "ADYEN_API_KEY",
+    "MAESTRO_PASSWORD",
 )
 
 # Common token *shapes*, redacted even if they didn't come from one of the

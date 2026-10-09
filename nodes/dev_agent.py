@@ -201,11 +201,8 @@ def _run_real(state: PipelineState) -> dict:
             None,
         )
 
-    commit_result = _commit_changes(
-        root,
-        f"ai-fix: attempt #{attempt_count} for {branch_name}",
-        [path for _, path in changed_files],
-    )
+    from utils.git_workspace import working_tree_diff_stat
+
     base_dev_finding = {
         "branch": branch_name,
         "base_branch": base_branch,
@@ -216,11 +213,29 @@ def _run_real(state: PipelineState) -> dict:
         "risk_flags": risk_flags,
         "claude_summary": claude_result.summary,
     }
-    if not commit_result.ok:
-        error = redact(commit_result.stderr.strip() or "git commit failed")
-        return _finalize("dev_failed", attempt_count, f"Could not commit the fix attempt: {error}", base_dev_finding, error)
 
-    base_dev_finding["diff_summary"] = _diff_summary(root)
+    # Jira lean POC: keep edits uncommitted until finalize_local after verifier pass.
+    defer_commit = bool(state.get("jira_issue_input"))
+    if defer_commit:
+        base_dev_finding["committed"] = False
+        base_dev_finding["diff_summary"] = working_tree_diff_stat(root)
+    else:
+        commit_result = _commit_changes(
+            root,
+            f"ai-fix: attempt #{attempt_count} for {branch_name}",
+            [path for _, path in changed_files],
+        )
+        if not commit_result.ok:
+            error = redact(commit_result.stderr.strip() or "git commit failed")
+            return _finalize(
+                "dev_failed",
+                attempt_count,
+                f"Could not commit the fix attempt: {error}",
+                base_dev_finding,
+                error,
+            )
+        base_dev_finding["committed"] = True
+        base_dev_finding["diff_summary"] = _diff_summary(root)
 
     build_result = build_app(fix_config)
     if not build_result.success:
@@ -243,7 +258,11 @@ def _run_real(state: PipelineState) -> dict:
     }
 
     test_note = test_result["summary"] if test_result.get("ran") else "no automated tests configured for this app"
-    detail = f"Applied attempt #{attempt_count} on branch '{branch_name}'; build succeeded; {test_note}."
+    commit_note = "uncommitted (finalize after verifier)" if defer_commit else "committed"
+    detail = (
+        f"Applied attempt #{attempt_count} on branch '{branch_name}' ({commit_note}); "
+        f"build succeeded; {test_note}."
+    )
 
     return _finalize("fix_applied", attempt_count, detail, dev_finding, None)
 

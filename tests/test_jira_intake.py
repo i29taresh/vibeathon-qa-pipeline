@@ -103,7 +103,7 @@ def test_jira_intake_agent_real_sets_ticket_id(monkeypatch):
         expected_behavior="e",
         actual_behavior="a",
         confidence=0.7,
-        reproduction_steps=["step"],
+        reproduction_steps=["Tap Settings", "Open Notifications"],
         evidence_paths=[],
     )
 
@@ -113,14 +113,30 @@ def test_jira_intake_agent_real_sets_ticket_id(monkeypatch):
             finding=fake_finding,
             issue_key="TST-99",
             issue_url="https://jira.example/browse/TST-99",
+            jira_baseline={
+                "issue_key": "TST-99",
+                "reproduction_steps": ["Tap Settings", "Open Notifications"],
+                "description_text": "Tap Settings then Open Notifications",
+            },
         )
 
+    from utils.maestro_flow_gen import MaestroFlowGenResult
+
+    flow_path = root / "local" / "runs" / "TST-99" / "repro.yaml"
+    flow_path.parent.mkdir(parents=True, exist_ok=True)
+    flow_path.write_text("appId: de.payzy.pro.pre_prod\n---\n- launchApp\n", encoding="utf-8")
+
     monkeypatch.setattr("nodes.jira_intake_agent.intake_from_jira", fake_intake)
+    monkeypatch.setattr(
+        "nodes.jira_intake_agent.generate_and_save_flow",
+        lambda *a, **k: MaestroFlowGenResult(success=True, flow_path=flow_path, yaml_text="x", steps=[]),
+    )
 
     out = jira_intake_agent(state)
     assert out["ticket_id"] == "TST-99"
     assert out["jira_issue_input"] is True
     assert out["qa_finding"]["failure_type"] == "functional"
+    assert out.get("maestro_flow_path") == str(flow_path)
 
 
 def test_ticket_agent_skips_create_on_jira_input_first_pass():

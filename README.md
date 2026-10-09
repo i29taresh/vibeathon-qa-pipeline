@@ -71,7 +71,20 @@ python main.py --app <name> --mode real --flow <flow_file.yaml> --max-attempts 5
 # device availability, test-command configuration, and reference assets.
 # Never builds, installs, edits, or touches a real application.
 python main.py --app <name> --preflight
+
+# Bootstrap (clone/warm build/repo map) then force if needed:
+python main.py --app b2b_android --bootstrap
 ```
+
+### Lean Android POC (Jira → Maestro → local commit)
+
+Android-only path for `b2b_android` + `payzyshared`: no GitLab push/MR.
+
+1. Set env: `JIRA_*`, `CURSOR_API_KEY`, `MAESTRO_EMAIL`, `MAESTRO_PASSWORD` (OTP in the generated flow is hardcoded `0000`).
+2. Emulator already running; bootstrap once: `python main.py --app b2b_android --bootstrap`.
+3. Dashboard **Run pipeline**: mode `real`, primary `b2b_android`, paste a Jira key (required). Or CLI with `--jira-issue KEY-123`.
+4. Pipeline: ensure `develop` → Jira STR → `local/runs/<KEY>/repro.yaml` (login + STR) → RCA → reuse Jira ticket → uncommitted fix on `ai-fix/<KEY>` → optional `publishToMavenLocal` `{artifact.version}-{TICKET}` + pin b2b → build/install DeOdsPre-prodDebug → Maestro + after-video verifier → on pass, **local commit** + maven cleanup + history under `local/runs/<KEY>/`.
+5. Inspect **Test results** / **History** in the dashboard (after video + verifier comments + branch/sha).
 
 ## Configuring a new app
 

@@ -1,7 +1,7 @@
 name: b2b-android
 platform: android
 repo: allios/touchpoint/android/b2b-android
-clone_path: /Users/tareshshrma/StudioProjects/b2b-android
+clone_path: /Users/shivangsingh/StudioProjects/b2b-android
 base_branch: develop
 flows_dir: flows/b2b-android
 reference_dir: references/b2b-android
@@ -21,13 +21,17 @@ dependencies:
   relationship: library
 device:
   android:
-    avd_name: pixel_7_api_34
+    # Must match an AVD from `emulator -list-avds` on this machine.
+    # No Play services → more /data space for APK installs during retest.
+    avd_name: Pixel_7a_API_34_extension_level_7_arm64-v8
     api_level: 34
 build:
   android:
     module: :app
-    build_command: ./gradlew :app:assembleGrPayzyDevDebug
-    artifact_path: app/build/outputs/apk/grPayzy/dev/debug/app-gr-payzy-dev-debug.apk
+    # POC: DE + ODS + pre-prod only (natco=de, brand=ods, environment=pre-prod)
+    # Gradle keeps the hyphen from the "pre-prod" flavor in task/path names.
+    build_command: ./gradlew :app:assembleDeOdsPre-prodDebug
+    artifact_path: app/build/outputs/apk/deOdsPre-prod/debug/app-de-ods-pre-prod-debug.apk
     install_command: adb install -r {artifact_path}
-    package_id: gr.payzy.pro.dev
-    test_command: ./gradlew :app:testGrPayzyDevDebugUnitTest
+    package_id: de.payzy.pro.pre_prod
+    test_command: ./gradlew :app:testDeOdsPre-prodDebugUnitTest

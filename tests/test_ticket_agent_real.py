@@ -1,8 +1,8 @@
 """Unit tests for nodes.ticket_agent's "real" mode.
 
-utils.github.{check_auth,create_issue,comment_on_issue} are all mocked at the
-nodes.ticket_agent module level - no real `gh` binary and no real GitHub API
-call happens anywhere in this file, so no test here ever creates a real issue.
+utils.github.{check_auth,create_issue} are mocked at the nodes.ticket_agent
+module level - no real `gh` binary and no real GitHub API call happens
+anywhere in this file. Retry comments are disabled (docile mode).
 """
 
 from __future__ import annotations
@@ -149,27 +149,19 @@ def test_includes_available_screenshot_attachments(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Retries: comment instead of duplicate
+# Retries: reuse ticket_id, never post comments (docile mode)
 # --------------------------------------------------------------------------
 
-def test_retry_comments_on_existing_issue_instead_of_creating(tmp_path, monkeypatch):
+def test_retry_reuses_ticket_without_commenting(tmp_path, monkeypatch):
     cfg = _make_config(tmp_path)
     _patch_auth(monkeypatch)
 
     create_calls = []
-    comment_calls = []
-
     monkeypatch.setattr(
         ticket_agent_mod,
         "create_issue",
         lambda *a, **k: create_calls.append(1) or IssueResult(success=True, number=99, url="x"),
     )
-
-    def fake_comment_on_issue(repo, issue_number, body, cwd, attachments=None, timeout=30.0):
-        comment_calls.append({"issue_number": issue_number, "body": body})
-        return IssueResult(success=True, number=issue_number, url="https://github.com/acme/app/issues/42")
-
-    monkeypatch.setattr(ticket_agent_mod, "comment_on_issue", fake_comment_on_issue)
 
     state = _real_state(
         cfg,
@@ -180,22 +172,24 @@ def test_retry_comments_on_existing_issue_instead_of_creating(tmp_path, monkeypa
     update = ticket_agent(state)
 
     assert update["ticket_id"] == "42"
+    assert update["status"] == "ticket_skipped"
+    assert update["ticket_finding"]["comment_suppressed"] is True
     assert create_calls == []
-    assert len(comment_calls) == 1
-    assert comment_calls[0]["issue_number"] == 42
-    assert "Retry update" in comment_calls[0]["body"]
-    assert "0.4" in comment_calls[0]["body"]
+    assert "Retry update" in update["ticket_finding"]["body"]
+    assert "0.4" in update["ticket_finding"]["body"]
+    assert "comments are disabled" in update["ticket_finding"]["reason"]
 
 
-def test_retry_with_non_numeric_ticket_id_fails_without_losing_findings(tmp_path, monkeypatch):
+def test_retry_with_non_numeric_ticket_id_still_skips_comment(tmp_path, monkeypatch):
     cfg = _make_config(tmp_path)
     _patch_auth(monkeypatch)
 
     state = _real_state(cfg, qa_finding=_functional_qa_finding(), rca_finding=_rca_finding(), ticket_id="MOCK-APP-1")
     update = ticket_agent(state)
 
-    assert update["status"] == "ticket_failed"
-    assert "not a valid GitHub issue number" in update["last_error"]
+    assert update["status"] == "ticket_skipped"
+    assert update["ticket_id"] == "MOCK-APP-1"
+    assert update["ticket_finding"]["comment_suppressed"] is True
     assert "## Retry update" in update["ticket_finding"]["body"]
 
 
@@ -272,10 +266,10 @@ def test_dry_run_renders_report_without_calling_gh(tmp_path, monkeypatch):
     assert update["ticket_id"] is None
 
 
-def test_dry_run_on_retry_shows_comment_not_full_report(tmp_path, monkeypatch):
+def test_dry_run_on_retry_shows_followup_body_without_publishing(tmp_path, monkeypatch):
     cfg = _make_config(tmp_path)
-    comment_calls = []
-    monkeypatch.setattr(ticket_agent_mod, "comment_on_issue", lambda *a, **k: comment_calls.append(1))
+    create_calls = []
+    monkeypatch.setattr(ticket_agent_mod, "create_issue", lambda *a, **k: create_calls.append(1))
 
     state = _real_state(
         cfg, qa_finding=_functional_qa_finding(), rca_finding=_rca_finding(), ticket_id="42", dry_run=True
@@ -284,7 +278,8 @@ def test_dry_run_on_retry_shows_comment_not_full_report(tmp_path, monkeypatch):
 
     assert update["status"] == "ticket_dry_run"
     assert "Retry update" in update["ticket_finding"]["body"]
-    assert comment_calls == []
+    assert "without commenting" in update["ticket_finding"]["action"]
+    assert create_calls == []
     assert update["ticket_id"] == "42"
 
 

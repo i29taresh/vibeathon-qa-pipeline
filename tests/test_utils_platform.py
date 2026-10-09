@@ -47,6 +47,7 @@ def test_select_android_device_found(monkeypatch):
         ]
     )
     monkeypatch.setattr(platform_mod, "run_command", fake)
+    monkeypatch.setattr(platform_mod, "unlock_android_device", lambda *a, **k: None)
 
     result = select_device(cfg)
 
@@ -62,7 +63,7 @@ def test_select_android_device_not_running(monkeypatch):
     result = select_device(cfg)
 
     assert not result.success
-    assert "not currently running" in result.error
+    assert "No Android device" in result.error or "not currently running" in result.error
 
 
 def test_select_ios_device_already_booted(monkeypatch):

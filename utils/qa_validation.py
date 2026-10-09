@@ -62,7 +62,13 @@ class ReferenceMaterials:
     expected_screenshots: list[Path]
 
 
-def run_qa_check(app_config: AppConfig, flow_name: str) -> QAFinding:
+def run_qa_check(
+    app_config: AppConfig,
+    flow_name: str,
+    *,
+    flow_path: Path | str | None = None,
+    skip_acceptance_criteria: bool = False,
+) -> QAFinding:
     """Validate, select a device, run `flow_name`, and judge the result.
 
     This is the whole QA validation routine in one call: flow-exists check,
@@ -71,14 +77,20 @@ def run_qa_check(app_config: AppConfig, flow_name: str) -> QAFinding:
     available) an LLM visual-regression check layered on top of the
     deterministic functional result. See `build_finding` for the pass/fail
     rules this enforces.
+
+    When ``flow_path`` is set (generated Jira repro YAML), that file is used
+    and acceptance-criteria loading is skipped unless criteria exist.
     """
-    finding = validate_flow_exists(app_config, flow_name)
+    finding = validate_flow_exists(app_config, flow_name, flow_path=flow_path)
 
     references: Optional[ReferenceMaterials] = None
     if finding is None:
-        references = load_reference_materials(app_config, flow_name)
-        if not references.criteria_text:
-            finding = unverified_finding(flow_name, app_config.reference_dir / Path(flow_name).stem)
+        if skip_acceptance_criteria or flow_path is not None:
+            references = ReferenceMaterials(criteria_text="(generated Jira flow)", criteria_path=None, expected_screenshots=[])
+        else:
+            references = load_reference_materials(app_config, flow_name)
+            if not references.criteria_text:
+                finding = unverified_finding(flow_name, app_config.reference_dir / Path(flow_name).stem)
 
     device_id: Optional[str] = None
     if finding is None:
@@ -91,7 +103,12 @@ def run_qa_check(app_config: AppConfig, flow_name: str) -> QAFinding:
         previous = os.environ.get("QA_RECORD_SCREEN")
         os.environ["QA_RECORD_SCREEN"] = "1"
         try:
-            maestro_result = run_flow(app_config, flow_name, device_id)
+            if flow_path is not None:
+                maestro_result = run_flow(
+                    app_config, flow_name, device_id, flow_path=flow_path, record_screen=True
+                )
+            else:
+                maestro_result = run_flow(app_config, flow_name, device_id)
         finally:
             if previous is None:
                 os.environ.pop("QA_RECORD_SCREEN", None)
@@ -112,20 +129,29 @@ def run_qa_check(app_config: AppConfig, flow_name: str) -> QAFinding:
         else:
             step_results = parse_junit_report(maestro_result.report_path)
             functional_passed = maestro_result.success and not any(not s.passed for s in step_results)
-            llm_data = analyze_with_llm(app_config, flow_name, references, maestro_result, functional_passed)
+            if skip_acceptance_criteria or flow_path is not None:
+                llm_data = None
+            else:
+                llm_data = analyze_with_llm(app_config, flow_name, references, maestro_result, functional_passed)
             finding = build_finding(flow_name, maestro_result, step_results, llm_data)
 
     return finding
 
 
-def validate_flow_exists(app_config: AppConfig, flow_name: str) -> Optional[QAFinding]:
+def validate_flow_exists(
+    app_config: AppConfig,
+    flow_name: str,
+    flow_path: Path | str | None = None,
+) -> Optional[QAFinding]:
+    from utils.maestro import _resolve_flow_path
+
     try:
-        flow_path = ensure_within(app_config.flows_dir / flow_name, app_config.flows_dir)
+        resolved = _resolve_flow_path(app_config, flow_name, flow_path=flow_path)
     except PathSecurityError as exc:
         return infrastructure_finding(flow_name, f"Flow path is invalid: {exc}")
 
-    if not flow_path.is_file():
-        return infrastructure_finding(flow_name, f"Flow file not found: {flow_path}")
+    if not resolved.is_file():
+        return infrastructure_finding(flow_name, f"Flow file not found: {resolved}")
 
     return None
 

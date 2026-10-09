@@ -9,11 +9,17 @@ Supports two explicit execution modes (`--mode mock|real`, default mock):
 device availability, test command, reference assets) instead of the
 pipeline - see `_run_preflight` below. It never builds, installs, edits, or
 touches a real application.
+
+`--bootstrap` clones missing repos, warms each configured build, writes a
+repo map and ready marker under `local/bootstrap/`. Real mode refuses to
+start without that marker unless `--force` is set. `--probe-search` times
+two semSearch-only agent runs and writes nothing.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -72,6 +78,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run a read-only real-mode diagnostic (config/auth/dependencies/device/tests/references) and exit.",
     )
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="Clone missing repos, warm builds, write repo maps and a ready marker, then exit.",
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="With --bootstrap: skip the build warm-up step.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Real mode: allow a run even when the bootstrap ready marker is missing.",
+    )
+    parser.add_argument(
+        "--probe-search",
+        action="store_true",
+        help="Time two semSearch-only Cursor agent runs against the primary checkout and exit.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -82,6 +108,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.preflight:
         return _run_preflight(app_config, app_stem=args.app)
+
+    if args.bootstrap:
+        from utils.bootstrap import bootstrap_project
+
+        result = bootstrap_project(args.app, skip_build=args.skip_build)
+        if not result.success:
+            print(f"Bootstrap failed: {result.error}", file=sys.stderr)
+            return 1
+        print(f"Bootstrap complete. Marker: {result.marker_path}")
+        return 0
+
+    if args.probe_search:
+        return _run_probe_search(app_config, app_stem=args.app)
 
     if args.jira_issue and args.mode != "real":
         print("Config error: --jira-issue requires --mode real.", file=sys.stderr)
@@ -107,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         timeout_seconds=args.timeout,
         project_graph=project_graph,
+        force_unbootstrapped=args.force,
     )
 
     banner = f"=== Running pipeline for '{args.app}' ({app_config.platform}) | mode={args.mode}"
@@ -259,9 +299,104 @@ def _run_preflight(app_config: AppConfig, app_stem: str | None = None) -> int:
     )
 
     checks.extend(_check_reference_assets(app_config))
+    stem = app_stem or app_config.name
+    checks.extend(_check_base_branch_warnings(project_graph or {stem: app_config}))
+
+    from utils.bootstrap import is_ready, marker_path
+
+    ready = is_ready(stem)
+    checks.append(
+        _check(
+            "Bootstrap ready marker",
+            False,
+            ready,
+            f"found {marker_path(stem)}" if ready else f"missing {marker_path(stem)} — run --bootstrap",
+        )
+    )
+
+    maestro_email = bool(os.environ.get("MAESTRO_EMAIL"))
+    maestro_password = bool(os.environ.get("MAESTRO_PASSWORD"))
+    checks.append(
+        _check(
+            "MAESTRO_EMAIL / MAESTRO_PASSWORD",
+            False,
+            maestro_email and maestro_password,
+            "set for Jira STR→Maestro login prefix (OTP hardcoded 0000)"
+            if maestro_email and maestro_password
+            else "missing — required for lean Android POC flow generation",
+        )
+    )
 
     _print_preflight_report(checks)
     return 0 if all(c["passed"] for c in checks if c["critical"]) else 1
+
+
+def _check_base_branch_warnings(graph: dict[str, AppConfig]) -> list[dict]:
+    """Advisory: warn when a checkout exists but HEAD is not base_branch."""
+    from utils.bootstrap import current_branch
+
+    checks: list[dict] = []
+    for stem, cfg in graph.items():
+        if not (cfg.clone_path / ".git").is_dir():
+            checks.append(
+                _check(
+                    f"Base branch: {stem}",
+                    False,
+                    False,
+                    f"no git checkout at {cfg.clone_path}",
+                )
+            )
+            continue
+        branch = current_branch(cfg.clone_path)
+        on_base = branch == cfg.base_branch
+        detail = (
+            f"on '{branch}' (base_branch={cfg.base_branch})"
+            if branch
+            else f"could not read HEAD (base_branch={cfg.base_branch})"
+        )
+        if on_base:
+            detail = f"on base branch '{cfg.base_branch}'"
+        checks.append(_check(f"Base branch: {stem}", False, on_base, detail))
+    return checks
+
+
+def _run_probe_search(app_config: AppConfig, app_stem: str | None = None) -> int:
+    """Time two identical semSearch-only agent runs; does not write a ready marker."""
+    import time
+
+    from utils.cursor_agent import run_agent_prompt
+
+    cwd = app_config.clone_path
+    if not cwd.is_dir():
+        print(f"Probe failed: clone_path does not exist: {cwd}", file=sys.stderr)
+        return 1
+
+    prompt = (
+        "Use only semantic search. Find where the primary login or consent UI screen "
+        "is implemented. Reply with a short list of file paths and one sentence. "
+        "Do not edit files."
+    )
+    print(f"=== semSearch probe for '{app_stem or app_config.name}' at {cwd} ===\n")
+    latencies: list[float] = []
+    for i in range(1, 3):
+        started = time.monotonic()
+        ok, text, err = run_agent_prompt(
+            prompt,
+            cwd,
+            timeout=180.0,
+            tools=["semSearch"],
+        )
+        elapsed = time.monotonic() - started
+        latencies.append(elapsed)
+        status = "ok" if ok else f"failed: {err}"
+        print(f"Run {i}: {elapsed:.1f}s ({status})")
+        if text:
+            preview = " ".join(text.split())[:240]
+            print(f"  preview: {preview}")
+        print()
+    if len(latencies) == 2:
+        print(f"Delta (run2 - run1): {latencies[1] - latencies[0]:+.1f}s")
+    return 0
 
 
 def _check(name: str, critical: bool, passed: bool, detail: str) -> dict:

@@ -95,6 +95,21 @@ class PipelineState(TypedDict, total=False):
     # by graph.run_pipeline (also overridable via that function's own
     # `timeout` argument). None = no pipeline-level timeout.
     timeout_seconds: Optional[float]
+    # True = allow a real-mode run even when the bootstrap ready marker is
+    # missing (CLI --force / dashboard checkbox). Default False.
+    force_unbootstrapped: bool
+    # Absolute path to a generated Maestro repro YAML (Jira POC path).
+    maestro_flow_path: Optional[str]
+    # After-video frame verifier result (retest hard gate).
+    verifier_finding: dict[str, Any]
+    after_video_paths: list[str]
+    before_video_paths: list[str]
+    # Local finalize (commit, no push/MR) result for Jira POC path.
+    finalize_finding: dict[str, Any]
+    run_history_id: Optional[str]
+    maven_local_version: Optional[str]
+    payzy_shared_pin_original: Optional[str]
+    attempt_patch_paths: list[str]
     # Each node returns a single-item list here; LangGraph appends it to the
     # running history via operator.add instead of overwriting it.
     execution_history: Annotated[list[ExecutionRecord], operator.add]
@@ -115,6 +130,7 @@ def create_pipeline_state(
     dry_run: bool = False,
     timeout_seconds: Optional[float] = None,
     project_graph: Optional[dict[str, AppConfig]] = None,
+    force_unbootstrapped: bool = False,
 ) -> PipelineState:
     """Build pipeline state for CLI/dashboard (parses Jira URL/key, tolerates older initial_state)."""
     from utils.jira import normalize_issue_input
@@ -138,13 +154,16 @@ def create_pipeline_state(
         "dry_run": dry_run,
         "timeout_seconds": timeout_seconds,
         "project_graph": project_graph,
+        "force_unbootstrapped": force_unbootstrapped,
     }
     try:
         state = initial_state(**kwargs, jira_issue_key=jira_issue_key)
     except TypeError:
+        kwargs.pop("force_unbootstrapped", None)
         state = initial_state(**kwargs)
         if jira_issue_key:
             state["jira_issue_key"] = jira_issue_key
+        state["force_unbootstrapped"] = force_unbootstrapped
     return state
 
 
@@ -159,6 +178,7 @@ def initial_state(
     dry_run: bool = False,
     timeout_seconds: Optional[float] = None,
     project_graph: Optional[dict[str, AppConfig]] = None,
+    force_unbootstrapped: bool = False,
 ) -> PipelineState:
     """Build the starting PipelineState for one pipeline run.
 
@@ -177,6 +197,7 @@ def initial_state(
         "project_graph": graph,
         "flow_name": flow_name,
         "jira_issue_key": jira_issue_key,
+        "force_unbootstrapped": force_unbootstrapped,
         "jira_issue_input": False,
         "status": "pending",
         "passed": False,

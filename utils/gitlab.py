@@ -91,6 +91,26 @@ def _encode_project(project_path: str) -> str:
     return urllib.parse.quote(project_path, safe="")
 
 
+def clone_url(host: str, project_path: str, token: str | None = None) -> str:
+    """HTTPS clone URL for a GitLab project, with oauth2 token when provided.
+
+    The returned URL may contain a credential. Callers must not log it; pass
+    it straight to `git clone` and rely on utils.secrets.redact for any error text.
+    """
+    host = host.strip().rstrip("/")
+    if host.startswith("https://"):
+        host = host[len("https://") :]
+    elif host.startswith("http://"):
+        host = host[len("http://") :]
+    project = project_path.strip().strip("/")
+    if not _PROJECT_PATH_RE.match(project):
+        raise GitLabError(f"project_path must be a nested path, got {project_path!r}")
+    auth_token = token if token is not None else _token()
+    user = urllib.parse.quote("oauth2", safe="")
+    secret = urllib.parse.quote(auth_token, safe="")
+    return f"https://{user}:{secret}@{host}/{project}.git"
+
+
 def format_attachments(attachments: Sequence[Path] | None) -> str:
     if not attachments:
         return ""

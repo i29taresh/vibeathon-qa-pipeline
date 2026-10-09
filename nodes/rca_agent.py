@@ -694,10 +694,20 @@ def _ask_llm_for_root_cause(
     evidence_block = "\n\n".join(sections)
 
     repo_roots = "\n".join(f"- {key}: {cfg.clone_path}" for key, cfg in project_graph.items())
+    from utils.project_context import load_project_repo_maps
+
+    repo_map = load_project_repo_maps(project_graph)
+    repo_map_block = (
+        f"Project structure (from bootstrap repo map — use this to jump to the right modules "
+        f"instead of rediscovering layout):\n{repo_map}\n\n"
+        if repo_map
+        else ""
+    )
     prompt = (
         "You are a root-cause-analysis assistant for a mobile QA pipeline.\n\n"
         "You have read-only tools (grep, glob, ls, read, semantic search) over these checked-out "
         f"repositories:\n{repo_roots}\n\n"
+        f"{repo_map_block}"
         "Investigate the failure in the source code before answering. Do not stop at the pre-gathered "
         "keyword hits below - they are only a starting point and are often shallow (for example they may "
         "match a strings resource rather than the screen that renders the UI). Work from the user-visible "

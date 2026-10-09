@@ -28,7 +28,7 @@ def test_verify_against_jira_baseline_requires_current_screenshots(tmp_path):
     assert result.error == "missing_current_evidence"
 
 
-def test_retest_requires_jira_and_maestro_pass(monkeypatch, tmp_path):
+def test_retest_verifier_fail_retries_to_rca(monkeypatch, tmp_path):
     root = Path(__file__).resolve().parents[1]
     cfg = load_app_config("sample_android", project_root=root)
 
@@ -41,22 +41,37 @@ def test_retest_requires_jira_and_maestro_pass(monkeypatch, tmp_path):
         actual_behavior="a",
         confidence=1.0,
         evidence_paths=[str(tmp_path / "after.png")],
+        video_paths=[str(tmp_path / "after.mp4")],
     )
     (tmp_path / "after.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (tmp_path / "after.mp4").write_bytes(b"fake")
 
     monkeypatch.setattr("nodes.retest_agent.build_app", lambda _c: MagicMock(success=True, artifact_path=tmp_path / "app.apk", error=None))
     monkeypatch.setattr("nodes.retest_agent.select_device", lambda _c: MagicMock(success=True, details={"device_id": "dev-1"}, error=None))
     monkeypatch.setattr("nodes.retest_agent.install_app", lambda *_a, **_k: MagicMock(success=True, error=None))
     monkeypatch.setattr("nodes.retest_agent.run_qa_check", lambda *_a, **_k: pass_finding)
+    monkeypatch.setattr("nodes.retest_agent.write_patch", lambda *_a, **_k: True)
+    monkeypatch.setattr("nodes.retest_agent.reset_hard", lambda *_a, **_k: True)
+    monkeypatch.setattr("nodes.retest_agent.resolve_fix_app_config", lambda s: ("sample_android", cfg))
     monkeypatch.setattr(
-        "nodes.retest_agent.verify_against_jira_baseline",
-        lambda *_a, **_k: JiraVerificationResult(
+        "nodes.retest_agent.verify_after_video",
+        lambda *_a, **_k: MagicMock(
             passed=False,
             issue_resolved=False,
-            description="Still broken per Jira repro",
-            expected_behavior="e",
-            actual_behavior="still bad",
-            confidence=0.8,
+            comments="Still blank password page",
+            confidence=0.9,
+            error=None,
+            frame_paths=[],
+            video_path=str(tmp_path / "after.mp4"),
+            to_dict=lambda: {
+                "passed": False,
+                "issue_resolved": False,
+                "comments": "Still blank password page",
+                "confidence": 0.9,
+                "error": None,
+                "frame_paths": [],
+                "video_path": str(tmp_path / "after.mp4"),
+            },
         ),
     )
 
@@ -64,16 +79,145 @@ def test_retest_requires_jira_and_maestro_pass(monkeypatch, tmp_path):
 
     state = initial_state("sample_android", cfg, mode="real", flow_name="login.yaml")
     state["jira_issue_input"] = True
-    state["jira_baseline"] = {"issue_key": "TST-9", "reproduction_steps": ["step"]}
-    state["dev_finding"] = {"build": {"success": True}, "files_changed": ["a.kt"]}
+    state["jira_baseline"] = {"issue_key": "TST-9", "reproduction_steps": ["step"], "expected_behavior": "fields"}
+    state["dev_finding"] = {"build": {"success": True}, "files_changed": ["a.kt"], "branch": "ai-fix/TST-9"}
     state["attempt_count"] = 1
     state["max_attempts"] = 3
 
     update = retest_agent(state)
     assert update["passed"] is False
     assert update["status"] == "retest_failed"
-    assert "Jira verification failed" in update["qa_finding"]["description"]
+    assert update["verifier_finding"]["passed"] is False
     assert update["retest_finding"]["jira_verification"]["passed"] is False
+
+
+def test_retest_verifier_pass_even_if_maestro_assert_failed(monkeypatch, tmp_path):
+    """Verifier is the hard gate for Jira POC — Maestro assert alone does not block pass."""
+    root = Path(__file__).resolve().parents[1]
+    cfg = load_app_config("sample_android", project_root=root)
+    video = tmp_path / "after.mp4"
+    video.write_bytes(b"fake")
+
+    fail_finding = QAFinding(
+        flow_name="repro.yaml",
+        passed=False,
+        failure_type="functional",
+        description='Assertion is false: "New password" is visible',
+        expected_behavior="fields",
+        actual_behavior="missing",
+        confidence=1.0,
+        evidence_paths=[],
+        video_paths=[str(video)],
+    )
+    monkeypatch.setattr("nodes.retest_agent.build_app", lambda _c: MagicMock(success=True, artifact_path=tmp_path / "app.apk", error=None))
+    monkeypatch.setattr("nodes.retest_agent.select_device", lambda _c: MagicMock(success=True, details={"device_id": "dev-1"}, error=None))
+    monkeypatch.setattr("nodes.retest_agent.install_app", lambda *_a, **_k: MagicMock(success=True, error=None))
+    monkeypatch.setattr("nodes.retest_agent.run_qa_check", lambda *_a, **_k: fail_finding)
+    monkeypatch.setattr(
+        "nodes.retest_agent.verify_after_video",
+        lambda *_a, **_k: MagicMock(
+            passed=True,
+            issue_resolved=True,
+            comments="Password fields visible",
+            confidence=0.95,
+            error=None,
+            frame_paths=[],
+            video_path=str(video),
+            to_dict=lambda: {
+                "passed": True,
+                "issue_resolved": True,
+                "comments": "Password fields visible",
+                "confidence": 0.95,
+                "error": None,
+                "frame_paths": [],
+                "video_path": str(video),
+            },
+        ),
+    )
+
+    from state import initial_state
+
+    state = initial_state("sample_android", cfg, mode="real", flow_name="repro.yaml")
+    state["jira_issue_input"] = True
+    state["jira_baseline"] = {"issue_key": "WFDR-1", "expected_behavior": "fields"}
+    state["maestro_flow_path"] = str(tmp_path / "repro.yaml")
+    (tmp_path / "repro.yaml").write_text("appId: x\n---\n- launchApp\n", encoding="utf-8")
+    state["dev_finding"] = {
+        "build": {"success": True},
+        "files_changed": ["a.kt"],
+        "branch": "ai-fix/WFDR-1",
+    }
+    state["attempt_count"] = 2
+    state["max_attempts"] = 3
+
+    update = retest_agent(state)
+    assert update["passed"] is True
+    assert update["status"] == "retest_passed"
+    assert update["verifier_finding"]["passed"] is True
+    assert update["retest_finding"]["fix_branch"] == "ai-fix/WFDR-1"
+    assert update["after_video_paths"] == [str(video)]
+
+
+def test_retest_verifier_exhausted_marks_failed(monkeypatch, tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    cfg = load_app_config("sample_android", project_root=root)
+    video = tmp_path / "after.mp4"
+    video.write_bytes(b"fake")
+    finding = QAFinding(
+        flow_name="repro.yaml",
+        passed=False,
+        failure_type="functional",
+        description="still broken",
+        expected_behavior="e",
+        actual_behavior="a",
+        confidence=1.0,
+        video_paths=[str(video)],
+    )
+    monkeypatch.setattr("nodes.retest_agent.build_app", lambda _c: MagicMock(success=True, artifact_path=tmp_path / "a.apk", error=None))
+    monkeypatch.setattr("nodes.retest_agent.select_device", lambda _c: MagicMock(success=True, details={"device_id": "d"}, error=None))
+    monkeypatch.setattr("nodes.retest_agent.install_app", lambda *_a, **_k: MagicMock(success=True, error=None))
+    monkeypatch.setattr("nodes.retest_agent.run_qa_check", lambda *_a, **_k: finding)
+    monkeypatch.setattr("nodes.retest_agent.write_patch", lambda *_a, **_k: True)
+    monkeypatch.setattr("nodes.retest_agent.reset_hard", lambda *_a, **_k: True)
+    monkeypatch.setattr("nodes.retest_agent.resolve_fix_app_config", lambda s: ("sample_android", cfg))
+    monkeypatch.setattr(
+        "nodes.retest_agent.verify_after_video",
+        lambda *_a, **_k: MagicMock(
+            passed=False,
+            issue_resolved=False,
+            comments="not fixed",
+            confidence=0.9,
+            error=None,
+            frame_paths=[],
+            video_path=str(video),
+            to_dict=lambda: {
+                "passed": False,
+                "issue_resolved": False,
+                "comments": "not fixed",
+                "confidence": 0.9,
+                "error": None,
+                "frame_paths": [],
+                "video_path": str(video),
+            },
+        ),
+    )
+    from state import initial_state
+
+    state = initial_state("sample_android", cfg, mode="real", flow_name="repro.yaml")
+    state.update(
+        {
+            "jira_issue_input": True,
+            "jira_baseline": {"issue_key": "WFDR-1"},
+            "maestro_flow_path": str(tmp_path / "repro.yaml"),
+            "dev_finding": {"build": {"success": True}, "files_changed": ["a.kt"]},
+            "attempt_count": 3,
+            "max_attempts": 3,
+        }
+    )
+    (tmp_path / "repro.yaml").write_text("appId: x\n---\n- launchApp\n", encoding="utf-8")
+    update = retest_agent(state)
+    assert update["passed"] is False
+    assert update["status"] == "failed"
 
 
 def test_verify_uses_llm_json(monkeypatch, tmp_path):

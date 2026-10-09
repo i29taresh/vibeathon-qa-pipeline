@@ -14,8 +14,9 @@ Rules this node enforces:
   "none" (passed), "unverified" (no acceptance criteria), or "infrastructure"
   (unless `state["file_ticket_for_infrastructure"]` is explicitly set) all
   skip ticket creation rather than mislabeling something as an app bug.
-- A retry (state["ticket_id"] already set) gets a comment appended to the
-  existing issue, never a new one.
+- Retries never post comments (docile mode): when a ticket already exists the
+  node reuses `ticket_id` and keeps the rendered follow-up body under
+  `ticket_finding`, but does not call GitHub/Jira comment APIs.
 - `state["dry_run"]=True` renders the full title/body and returns it under
   `state["ticket_finding"]` without ever calling `gh`.
 - Any `gh`/GitHub failure (auth, permissions, API error) is reported via
@@ -33,8 +34,7 @@ from typing import Any, Optional
 from config import AppConfig, uses_jira_integration
 from state import PipelineState, log_node
 from utils import jira as jira_api
-from utils.github import check_auth, comment_on_issue, create_issue
-from utils.jira import parse_issue_key
+from utils.github import check_auth, create_issue
 
 
 def ticket_agent(state: PipelineState) -> dict:
@@ -113,11 +113,15 @@ def _run_real(state: PipelineState) -> dict:
     if dry_run:
         return _finalize_dry_run(title, body, attachments, existing_ticket_id, attempt_count, is_retry)
 
+    # Docile mode: never post retry comments; keep ticket_id and the rendered body locally.
+    if is_retry:
+        return _finalize_comment_suppressed(title, body, attachments, existing_ticket_id, attempt_count)
+
     cwd = app_config.clone_path if app_config.clone_path.is_dir() else Path.cwd()
 
     if uses_jira_integration(app_config):
         return _publish_jira(
-            app_config, title, body, attachments, existing_ticket_id, attempt_count, is_retry, state
+            app_config, title, body, attachments, existing_ticket_id, attempt_count, state
         )
 
     auth_status = check_auth(app_config.repo, cwd)
@@ -131,17 +135,7 @@ def _run_real(state: PipelineState) -> dict:
             title, body, attachments, existing_ticket_id, attempt_count,
         )
 
-    if is_retry:
-        try:
-            issue_number = int(existing_ticket_id)
-        except (TypeError, ValueError):
-            return _finalize_failure(
-                f"Existing ticket_id {existing_ticket_id!r} is not a valid GitHub issue number.",
-                title, body, attachments, existing_ticket_id, attempt_count,
-            )
-        result = comment_on_issue(app_config.repo, issue_number, body, cwd=cwd, attachments=attachments)
-    else:
-        result = create_issue(app_config.repo, title, body, cwd=cwd, labels=_derive_labels(qa_finding), attachments=attachments)
+    result = create_issue(app_config.repo, title, body, cwd=cwd, labels=_derive_labels(qa_finding), attachments=attachments)
 
     if not result.success:
         return _finalize_failure(result.error or "gh command failed.", title, body, attachments, existing_ticket_id, attempt_count)
@@ -149,7 +143,7 @@ def _run_real(state: PipelineState) -> dict:
     ticket_id = str(result.number) if result.number is not None else existing_ticket_id
     ticket_url = result.url or state.get("ticket_url")
     status = "ticket_ready"
-    detail = f"{'Reused existing' if is_retry else 'Filed new'} GitHub issue {app_config.repo}#{ticket_id} ({ticket_url})."
+    detail = f"Filed new GitHub issue {app_config.repo}#{ticket_id} ({ticket_url})."
     history = log_node("ticket_agent", status, attempt_count, detail=detail)
 
     return {
@@ -161,7 +155,7 @@ def _run_real(state: PipelineState) -> dict:
             "repo": app_config.repo,
             "issue_number": result.number,
             "issue_url": ticket_url,
-            "created": not is_retry,
+            "created": True,
             "dry_run": False,
             "title": title,
             "body": body,
@@ -177,7 +171,6 @@ def _publish_jira(
     attachments: list[Path],
     existing_ticket_id: Optional[str],
     attempt_count: int,
-    is_retry: bool,
     state: PipelineState,
 ) -> dict:
     jira = app_config.integrations.jira
@@ -203,28 +196,16 @@ def _publish_jira(
             attempt_count,
         )
 
-    if is_retry:
-        issue_key = parse_issue_key(str(existing_ticket_id)) or str(existing_ticket_id)
-        if not issue_key:
-            return _finalize_failure(
-                f"Existing ticket_id {existing_ticket_id!r} is not a valid Jira issue key.",
-                title,
-                body,
-                attachments,
-                existing_ticket_id,
-                attempt_count,
-            )
-        result = jira_api.comment_on_issue(issue_key, body, cwd=cwd, attachments=attachments)
-    else:
-        result = jira_api.create_issue(
-            jira.base_url,
-            jira.project_key,
-            title,
-            body,
-            issue_type=jira.issue_type,
-            cwd=cwd,
-            attachments=attachments,
-        )
+    # Retries are handled before _publish_jira (comment APIs are disabled).
+    result = jira_api.create_issue(
+        jira.base_url,
+        jira.project_key,
+        title,
+        body,
+        issue_type=jira.issue_type,
+        cwd=cwd,
+        attachments=attachments,
+    )
 
     if not result.success:
         return _finalize_failure(
@@ -239,7 +220,7 @@ def _publish_jira(
     ticket_id = result.key or existing_ticket_id
     ticket_url = result.url or state.get("ticket_url")
     status = "ticket_ready"
-    detail = f"{'Updated' if is_retry else 'Filed new'} Jira issue {ticket_id} ({ticket_url})."
+    detail = f"Filed new Jira issue {ticket_id} ({ticket_url})."
     history = log_node("ticket_agent", status, attempt_count, detail=detail)
     return {
         "ticket_id": ticket_id,
@@ -251,7 +232,7 @@ def _publish_jira(
             "project_key": jira.project_key,
             "issue_key": ticket_id,
             "issue_url": ticket_url,
-            "created": not is_retry,
+            "created": True,
             "dry_run": False,
             "title": title,
             "body": body,
@@ -286,10 +267,42 @@ def _finalize_skip(reason: str, existing_ticket_id: Optional[str], attempt_count
     }
 
 
+def _finalize_comment_suppressed(
+    title: str,
+    body: str,
+    attachments: list[Path],
+    existing_ticket_id: Optional[str],
+    attempt_count: int,
+) -> dict:
+    """Reuse the existing ticket without posting a follow-up comment (docile mode)."""
+    reason = (
+        f"Reused existing ticket {existing_ticket_id} without posting a comment "
+        "(ticket_agent comments are disabled)."
+    )
+    status = "ticket_skipped"
+    history = log_node("ticket_agent", status, attempt_count, detail=reason)
+    return {
+        "ticket_id": existing_ticket_id,
+        "status": status,
+        "ticket_finding": {
+            "skipped": True,
+            "reason": reason,
+            "comment_suppressed": True,
+            "title": title,
+            "body": body,
+            "attachments": [str(p) for p in attachments],
+        },
+        "execution_history": [history],
+    }
+
+
 def _finalize_dry_run(
     title: str, body: str, attachments: list[Path], existing_ticket_id: Optional[str], attempt_count: int, is_retry: bool
 ) -> dict:
-    action = "comment on the existing issue" if is_retry else "create a new issue"
+    if is_retry:
+        action = "reuse the existing issue without commenting (comments disabled)"
+    else:
+        action = "create a new issue"
     status = "ticket_dry_run"
     detail = f"Dry run: would {action} (not published)."
     history = log_node("ticket_agent", status, attempt_count, detail=detail)

@@ -1,15 +1,16 @@
 """LangGraph wiring for the QA pipeline.
 
-    START -> qa_agent  OR  (when state["jira_issue_key"] is set) -> jira_intake_agent -> rca_agent
+    START -> qa_agent  OR  (when state["jira_issue_key"] is set) -> jira_intake_agent
                |-- passes                                  --> END (status=no_bugs_found, set by qa_agent)
                |-- confirmed defect (functional/visual)     --> rca_agent -> ticket_agent -> dev_agent -> retest_agent
                '-- unverified/infrastructure (real mode)    --> END, blocked - no ticket filed
 
-    retest_agent (Maestro + Jira baseline verification when jira_issue_input) -->
-               |-- passes                                   --> merge_step -> END (opens a PR, never merges)
-               |-- infrastructure failure (real mode)        --> END, blocked
-               |-- confirmed failure, attempts remaining     --> rca_agent (loop)
-               '-- confirmed failure, attempts exhausted     --> END (status=needs_human_review)
+    retest_agent (Maestro + after-video verifier when jira_issue_input) -->
+               |-- verifier passed + jira                     --> finalize_local (Jira: recording + branch) -> END
+               |-- passes (non-Jira)                          --> merge_step -> END (opens a PR, never merges)
+               |-- infrastructure failure (real mode)         --> END, blocked
+               |-- verifier not fixed, attempts remaining     --> rca_agent (loop)
+               '-- verifier not fixed after max_attempts      --> END (status=failed)
 
 ticket_agent reuses the existing ticket_id and dev_agent reuses the existing
 ai-fix/<ticket_id> branch on every pass through the loop, so retries never
@@ -36,6 +37,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from nodes.dev_agent import dev_agent
+from nodes.finalize_local import finalize_local
 from nodes.jira_intake_agent import jira_intake_agent
 from nodes.merge_step import merge_step
 from nodes.qa_agent import qa_agent
@@ -88,6 +90,17 @@ def _route_from_start(state: PipelineState) -> str:
     return "qa_agent"
 
 
+def _route_after_jira(state: PipelineState) -> str:
+    """After Jira intake: stop on unverified/failed intake; else continue to RCA."""
+    status = state.get("status") or ""
+    if status in ("intake_failed", "intake_unverified"):
+        return "blocked"
+    qa_finding = state.get("qa_finding")
+    if qa_finding and qa_finding.get("failure_type") in _NON_DEFECT_FAILURE_TYPES:
+        return "blocked"
+    return "rca_agent"
+
+
 def _route_after_qa(state: PipelineState) -> str:
     if state.get("passed"):
         return "end"
@@ -101,6 +114,9 @@ def _route_after_qa(state: PipelineState) -> str:
 
 def _route_after_retest(state: PipelineState) -> str:
     if state.get("passed"):
+        # Lean Android POC: local commit only (no GitLab MR) for Jira-driven runs.
+        if state.get("jira_issue_input"):
+            return "finalize"
         return "merge"
 
     # An infrastructure failure isn't something another code-fix attempt
@@ -110,7 +126,9 @@ def _route_after_retest(state: PipelineState) -> str:
     if qa_finding and qa_finding.get("failure_type") == "infrastructure":
         return "blocked"
 
-    if state.get("status") == "needs_human_review":
+    # Jira POC marks status=failed after max verifier retries; classic path uses
+    # needs_human_review. Both end the loop (no further RCA).
+    if state.get("status") in ("needs_human_review", "failed"):
         return "stop"
 
     attempt_count = state.get("attempt_count", 0)
@@ -132,11 +150,16 @@ def build_graph() -> CompiledStateGraph:
     graph.add_node("dev_agent", dev_agent)
     graph.add_node("retest_agent", retest_agent)
     graph.add_node("merge_step", merge_step)
+    graph.add_node("finalize_local", finalize_local)
 
     graph.add_conditional_edges(
         START, _route_from_start, {"jira_intake": "jira_intake_agent", "qa_agent": "qa_agent"}
     )
-    graph.add_edge("jira_intake_agent", "rca_agent")
+    graph.add_conditional_edges(
+        "jira_intake_agent",
+        _route_after_jira,
+        {"rca_agent": "rca_agent", "blocked": END},
+    )
     graph.add_conditional_edges(
         "qa_agent", _route_after_qa, {"end": END, "blocked": END, "rca_agent": "rca_agent"}
     )
@@ -146,9 +169,16 @@ def build_graph() -> CompiledStateGraph:
     graph.add_conditional_edges(
         "retest_agent",
         _route_after_retest,
-        {"merge": "merge_step", "blocked": END, "stop": END, "retry": "rca_agent"},
+        {
+            "merge": "merge_step",
+            "finalize": "finalize_local",
+            "blocked": END,
+            "stop": END,
+            "retry": "rca_agent",
+        },
     )
     graph.add_edge("merge_step", END)
+    graph.add_edge("finalize_local", END)
 
     return graph.compile()
 
@@ -175,6 +205,33 @@ def run_pipeline(
             app_config = state.get("app_config")
             if app_config is not None:
                 ensure_source_isolated(app_config.clone_path)
+
+        if not state.get("force_unbootstrapped"):
+            from utils.bootstrap import is_ready, marker_path
+
+            primary = state.get("app_name") or getattr(state.get("app_config"), "name", None)
+            if primary and not is_ready(str(primary)):
+                raise PipelineSafetyError(
+                    f"Project '{primary}' has not been bootstrapped "
+                    f"(missing {marker_path(str(primary))}). "
+                    f"Run `python main.py --app {primary} --bootstrap` first, "
+                    "or pass --force / set force_unbootstrapped to skip."
+                )
+
+        # Jira-driven POC: start every graph checkout on its base_branch
+        # (unless already on this run's ai-fix/<ticket>).
+        if state.get("jira_issue_key") or state.get("jira_issue_input"):
+            from utils.git_workspace import ensure_project_graph_on_base
+
+            graph_for_hygiene = state.get("project_graph") or {}
+            if graph_for_hygiene:
+                try:
+                    ensure_project_graph_on_base(
+                        graph_for_hygiene,
+                        ticket_id=state.get("ticket_id") or state.get("jira_issue_key"),
+                    )
+                except ValueError as exc:
+                    raise PipelineSafetyError(str(exc)) from exc
 
     pipeline = build_graph()
 

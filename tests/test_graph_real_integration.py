@@ -157,7 +157,7 @@ def _patch_all_external(monkeypatch, repo_dir: Path, maestro_results: list[Maest
         ),
     )
 
-    # --- ticket_agent: mocked GitHub issue create/comment ---
+    # --- ticket_agent: mocked GitHub issue create (comments disabled / docile) ---
     monkeypatch.setattr(ticket_agent_mod, "check_auth", lambda repo, cwd: AuthStatus(authenticated=True, can_write=True))
     create_issue_calls: list[dict] = []
     comment_calls: list[dict] = []
@@ -166,12 +166,7 @@ def _patch_all_external(monkeypatch, repo_dir: Path, maestro_results: list[Maest
         create_issue_calls.append({"title": title})
         return IssueResult(success=True, number=99, url="https://github.com/acme/app/issues/99")
 
-    def fake_comment_on_issue(repo, issue_number, body, cwd, attachments=None, timeout=30.0):
-        comment_calls.append({"issue_number": issue_number})
-        return IssueResult(success=True, number=issue_number, url="https://github.com/acme/app/issues/99")
-
     monkeypatch.setattr(ticket_agent_mod, "create_issue", fake_create_issue)
-    monkeypatch.setattr(ticket_agent_mod, "comment_on_issue", fake_comment_on_issue)
 
     # --- dev_agent: mocked issue fetch + build; claude faked, git left real ---
     monkeypatch.setattr(dev_agent_mod, "get_issue", lambda repo, number, cwd: IssueResult(success=False, error="not fetched in this test"))
@@ -234,7 +229,13 @@ def test_full_pipeline_fails_once_then_succeeds(tmp_path, monkeypatch, app_name)
     ]
     spies = _patch_all_external(monkeypatch, clone_dir, maestro_sequence)
 
-    state = initial_state(app_name=app_name, app_config=app_config, mode="real", flow_name="login.yaml")
+    state = initial_state(
+        app_name=app_name,
+        app_config=app_config,
+        mode="real",
+        flow_name="login.yaml",
+        force_unbootstrapped=True,
+    )
     final_state = run_pipeline(state)
 
     assert final_state["status"] == "ready_for_review"
@@ -251,8 +252,9 @@ def test_full_pipeline_fails_once_then_succeeds(tmp_path, monkeypatch, app_name)
     ]
 
     # Requirement #7: no duplicate ticket, no recreated fix branch across the retry.
+    # ticket_agent is docile on retry: reuses ticket_id, never posts comments.
     assert len(spies["create_issue_calls"]) == 1
-    assert len(spies["comment_calls"]) == 1
+    assert len(spies["comment_calls"]) == 0
     assert spies["checkout_calls"] == [["git", "checkout", "-b", "ai-fix/99", "main"]]  # only ever created once
     assert len(spies["create_pr_calls"]) == 1
     assert spies["create_pr_calls"][0]["head"] == "ai-fix/99"
@@ -283,7 +285,13 @@ def test_qa_pass_terminates_immediately_without_ticket_or_dev_work(tmp_path, mon
 
     spies = _patch_all_external(monkeypatch, clone_dir, [MaestroResult(success=True, exit_code=0, report_path=_write_report(tmp_path, "pass.xml", PASS_JUNIT))])
 
-    state = initial_state(app_name="sample_android", app_config=app_config, mode="real", flow_name="login.yaml")
+    state = initial_state(
+        app_name="sample_android",
+        app_config=app_config,
+        mode="real",
+        flow_name="login.yaml",
+        force_unbootstrapped=True,
+    )
     final_state = run_pipeline(state)
 
     assert final_state["status"] == "no_bugs_found"
@@ -301,7 +309,13 @@ def test_unverified_qa_result_is_blocked_without_ticket(tmp_path, monkeypatch):
 
     spies = _patch_all_external(monkeypatch, clone_dir, [])
 
-    state = initial_state(app_name="sample_android", app_config=app_config, mode="real", flow_name="login.yaml")
+    state = initial_state(
+        app_name="sample_android",
+        app_config=app_config,
+        mode="real",
+        flow_name="login.yaml",
+        force_unbootstrapped=True,
+    )
     final_state = run_pipeline(state)
 
     assert final_state["qa_finding"]["failure_type"] == "unverified"

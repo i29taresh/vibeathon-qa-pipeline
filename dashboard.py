@@ -30,6 +30,7 @@ from mock_scenarios import SCENARIOS
 from state import create_pipeline_state
 from utils import gitlab as gitlab_api
 from utils import jira as jira_api
+from utils.bootstrap import bootstrap_project, is_ready, marker_path, read_marker
 
 ROOT = Path(__file__).resolve().parent
 
@@ -48,6 +49,14 @@ WARNING = "#FFC857"
 ERROR = "#FF4D5E"
 
 PIPELINE_STEPS = ["qa_agent", "rca_agent", "ticket_agent", "dev_agent", "retest_agent", "merge_step"]
+PIPELINE_STEPS_JIRA = [
+    "jira_intake_agent",
+    "rca_agent",
+    "ticket_agent",
+    "dev_agent",
+    "retest_agent",
+    "finalize_local",
+]
 FLOW_SUFFIXES = (".yaml", ".yml")
 
 # LangGraph nodes that may run longer than a few seconds (show a “in progress” hint).
@@ -63,7 +72,7 @@ def _list_maestro_flows(cfg: AppConfig) -> list[str]:
 
 def _pipeline_step_order(jira_intake: bool) -> list[str]:
     if jira_intake:
-        return ["jira_intake_agent", *PIPELINE_STEPS[1:]]  # qa_agent skipped
+        return list(PIPELINE_STEPS_JIRA)
     return list(PIPELINE_STEPS)
 
 
@@ -255,8 +264,16 @@ SESSION_ENV_KEYS = [
     "JIRA_BASE_URL",
     "JIRA_EMAIL",
     "JIRA_API_TOKEN",
+    "ODS_ARTIFACTORY_USERNAME",
+    "ODS_ARTIFACTORY_PASSWORD",
+    "ADYEN_API_KEY",
     "GH_TOKEN",
     "GITHUB_TOKEN",
+    "MAESTRO_EMAIL",
+    "MAESTRO_PASSWORD",
+    "ANDROID_HOME",
+    "ANDROID_SDK_ROOT",
+    "EMULATOR_PIN",
 ]
 
 CSS = f"""
@@ -535,12 +552,17 @@ def _load_local_env_defaults() -> dict[str, str]:
 def _init_env_session() -> None:
     if "env_baseline" not in st.session_state:
         st.session_state.env_baseline = {k: os.environ.get(k) for k in SESSION_ENV_KEYS}
+    defaults = _load_local_env_defaults()
     if "env_overrides" not in st.session_state:
-        defaults = _load_local_env_defaults()
-        st.session_state.env_overrides = defaults
+        st.session_state.env_overrides = dict(defaults)
+    else:
+        # Merge newly added keys from local/dashboard_env.yaml without wiping edits.
         for key, value in defaults.items():
-            if value:
-                os.environ[key] = value
+            if value and not st.session_state.env_overrides.get(key):
+                st.session_state.env_overrides[key] = value
+    for key, value in st.session_state.env_overrides.items():
+        if value:
+            os.environ[key] = value
 
 
 def _apply_env_overrides() -> None:
@@ -760,21 +782,101 @@ def _connection_tests(cfg: AppConfig) -> None:
                     st.markdown(_auth_result_html(status), unsafe_allow_html=True)
 
 
+# Non-widget session keys — Streamlit deletes widget-bound keys when the page
+# is not rendered, so these must never be used as st.selectbox(..., key=...).
+_PIPE_CONFIG_KEYS = (
+    "pipe_app_name",
+    "pipe_mode",
+    "pipe_scenario",
+    "pipe_max_attempts",
+    "pipe_dry_run",
+    "pipe_force_unbootstrapped",
+    "pipe_skip_build",
+    "pipe_flow",
+    "pipe_jira_issue",
+)
+
+
+def _pipeline_config_defaults(apps: list[str]) -> dict[str, Any]:
+    default_app = "sample_android" if "sample_android" in apps else (apps[0] if apps else "")
+    scenarios = list(SCENARIOS)
+    return {
+        "pipe_app_name": default_app,
+        "pipe_mode": "mock",
+        "pipe_scenario": "fix_success" if "fix_success" in scenarios else (scenarios[0] if scenarios else ""),
+        "pipe_max_attempts": 3,
+        "pipe_dry_run": False,
+        "pipe_force_unbootstrapped": False,
+        "pipe_skip_build": False,
+        "pipe_flow": "login.yaml",
+        "pipe_jira_issue": "",
+    }
+
+
+def _ensure_pipeline_config_session(apps: list[str]) -> None:
+    """Persist Run-pipeline form values across sidebar page changes."""
+    defaults = _pipeline_config_defaults(apps)
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    if apps and st.session_state.get("pipe_app_name") not in apps:
+        st.session_state.pipe_app_name = defaults["pipe_app_name"]
+    if st.session_state.get("pipe_mode") not in ("mock", "real"):
+        st.session_state.pipe_mode = "mock"
+    scenarios = list(SCENARIOS)
+    if scenarios and st.session_state.get("pipe_scenario") not in scenarios:
+        st.session_state.pipe_scenario = defaults["pipe_scenario"]
+    try:
+        st.session_state.pipe_max_attempts = int(st.session_state.pipe_max_attempts)
+    except (TypeError, ValueError):
+        st.session_state.pipe_max_attempts = defaults["pipe_max_attempts"]
+
+
+def _clear_pipeline_config_session(apps: list[str]) -> None:
+    for key in _PIPE_CONFIG_KEYS:
+        st.session_state.pop(key, None)
+    _ensure_pipeline_config_session(apps)
+
+
+def _option_index(options: list[Any], value: Any, default: int = 0) -> int:
+    try:
+        return options.index(value)
+    except ValueError:
+        return default
+
+
 def page_run_pipeline() -> None:
     apps = list_app_config_names(ROOT)
     if not apps:
         st.error("No app configs in apps/.")
         return
 
+    _ensure_pipeline_config_session(apps)
+
     with st.container(border=True):
-        _section("Pipeline configuration", "target app and execution mode")
+        head_l, head_r = st.columns([4, 1])
+        with head_l:
+            _section("Pipeline configuration", "target app and execution mode")
+        with head_r:
+            if st.button("Clear", width="stretch", help="Reset pipeline configuration to defaults"):
+                _clear_pipeline_config_session(apps)
+                st.rerun()
+
         c1, c2 = st.columns(2)
         with c1:
             app_name = st.selectbox(
-                "Primary app", apps, index=apps.index("sample_android") if "sample_android" in apps else 0
+                "Primary app",
+                apps,
+                index=_option_index(apps, st.session_state.pipe_app_name),
             )
+            st.session_state.pipe_app_name = app_name
         with c2:
-            mode = st.selectbox("Mode", ["mock", "real"], index=0)
+            mode = st.selectbox(
+                "Mode",
+                ["mock", "real"],
+                index=_option_index(["mock", "real"], st.session_state.pipe_mode),
+            )
+            st.session_state.pipe_mode = mode
 
         try:
             cfg = load_app_config(app_name, project_root=ROOT)
@@ -786,13 +888,42 @@ def page_run_pipeline() -> None:
         scenario = None
         with c3:
             if mode == "mock":
-                scenario = st.selectbox("Mock scenario", list(SCENARIOS), index=list(SCENARIOS).index("fix_success"))
+                scenarios = list(SCENARIOS)
+                scenario = st.selectbox(
+                    "Mock scenario",
+                    scenarios,
+                    index=_option_index(scenarios, st.session_state.pipe_scenario),
+                )
+                st.session_state.pipe_scenario = scenario
             else:
                 st.selectbox("Mock scenario", ["— (real mode)"], disabled=True)
+                scenario = st.session_state.pipe_scenario
         with c4:
-            max_attempts = st.number_input("Max attempts", min_value=1, max_value=10, value=3, step=1)
-        dry_run = st.checkbox("Dry run (real: no publish/push)", value=False, disabled=(mode == "mock"))
+            max_attempts = st.number_input(
+                "Max attempts",
+                min_value=1,
+                max_value=10,
+                value=int(st.session_state.pipe_max_attempts),
+                step=1,
+            )
+            st.session_state.pipe_max_attempts = int(max_attempts)
+        dry_run = st.checkbox(
+            "Dry run (real: no publish/push)",
+            value=bool(st.session_state.pipe_dry_run),
+            disabled=(mode == "mock"),
+        )
+        st.session_state.pipe_dry_run = bool(dry_run)
+        force_unbootstrapped = st.checkbox(
+            "Force run without bootstrap marker",
+            value=bool(st.session_state.pipe_force_unbootstrapped),
+            disabled=(mode == "mock"),
+            help="Real mode only. Equivalent to CLI --force.",
+        )
+        st.session_state.pipe_force_unbootstrapped = bool(force_unbootstrapped)
 
+        ready = is_ready(app_name, project_root=ROOT)
+        marker = read_marker(app_name, project_root=ROOT)
+        ready_detail = marker.get("timestamp", "ready") if marker else str(marker_path(app_name, ROOT))
         if cfg is not None:
             st.markdown(
                 _stats_html(
@@ -800,23 +931,53 @@ def page_run_pipeline() -> None:
                         ("Platform", html.escape(cfg.platform)),
                         ("Repo", html.escape(str(cfg.repo))),
                         ("Mode", _pill(mode, "run" if mode == "real" else "info")),
+                        ("Bootstrap", _pill("ready" if ready else "not ready", "ok" if ready else "warn")),
                     ]
                 ),
                 unsafe_allow_html=True,
             )
+            st.caption(f"Ready marker: {ready_detail}")
 
-    flow = "default_flow"
-    jira_issue = ""
+    with st.container(border=True):
+        _section("Bootstrap", "clone, warm builds, write repo map (mutating)")
+        skip_build = st.checkbox("Skip build warm-up", value=bool(st.session_state.pipe_skip_build))
+        st.session_state.pipe_skip_build = bool(skip_build)
+        if st.button("Bootstrap project", width="stretch"):
+            _apply_env_overrides()
+            log_box = st.empty()
+            lines: list[str] = []
+
+            def _log(msg: str) -> None:
+                lines.append(msg)
+                log_box.markdown(
+                    f"<pre class='ox-log'>{html.escape(chr(10).join(lines))}</pre>",
+                    unsafe_allow_html=True,
+                )
+
+            result = bootstrap_project(app_name, project_root=ROOT, skip_build=skip_build, log=_log)
+            if result.success:
+                st.success(f"Bootstrap complete. Marker: {result.marker_path}")
+            else:
+                st.error(result.error or "Bootstrap failed.")
+
+    flow = st.session_state.get("pipe_flow") or "default_flow"
+    jira_issue = st.session_state.get("pipe_jira_issue") or ""
     if mode == "real" and cfg is not None:
         with st.container(border=True):
             _section("Real-mode inputs", "Maestro flow and optional Jira intake")
             flows = _list_maestro_flows(cfg)
             if flows:
+                saved_flow = st.session_state.pipe_flow
+                if saved_flow not in flows:
+                    saved_flow = flows[0]
+                    st.session_state.pipe_flow = saved_flow
                 flow = st.selectbox(
                     "Maestro flow (retest after fix)",
                     flows,
+                    index=_option_index(flows, saved_flow),
                     help="YAML file under flows_dir. Used after dev_agent to verify the fix (and for Jira+LLM verification screenshots).",
                 )
+                st.session_state.pipe_flow = flow
             else:
                 st.warning(
                     f"No Maestro flows found under `{cfg.flows_dir}`. "
@@ -824,15 +985,22 @@ def page_run_pipeline() -> None:
                 )
                 flow = st.text_input(
                     "Maestro flow filename",
-                    value="login.yaml",
+                    value=st.session_state.pipe_flow or "login.yaml",
                     help="e.g. login.yaml — must exist under the app's flows_dir.",
                 )
+                st.session_state.pipe_flow = flow
 
             jira_issue = st.text_input(
-                "Jira issue (optional)",
-                value="",
+                "Jira issue (required for lean Android POC)",
+                value=st.session_state.pipe_jira_issue or "",
                 placeholder="WFDR-25182 or https://…/browse/WFDR-25182",
-                help="When set, skips initial Maestro QA and starts from this ticket (attachments + video frames).",
+                help="Starts from this ticket: STR→Maestro YAML, login/OTP from MAESTRO_* env (OTP hardcoded 0000).",
+            )
+            st.session_state.pipe_jira_issue = jira_issue
+            st.caption(
+                "Maestro login uses `MAESTRO_EMAIL` / `MAESTRO_PASSWORD` from Environment variables; "
+                "OTP is `0000`. If the Jira text mentions Business Owner, the flow starts with "
+                "Launch App → Business Owner → Intro screens → Login, then credentials."
             )
 
     if cfg is not None:
@@ -845,18 +1013,22 @@ def page_run_pipeline() -> None:
                 cfg = load_app_config(app_name, project_root=ROOT)
             project_graph = None
             if mode == "real":
+                if not (jira_issue or "").strip():
+                    st.error("Lean Android POC requires a Jira issue key or browse URL.")
+                    st.stop()
+                if not os.environ.get("MAESTRO_EMAIL") or not os.environ.get("MAESTRO_PASSWORD"):
+                    st.warning(
+                        "MAESTRO_EMAIL / MAESTRO_PASSWORD are not set — flow generation will fail. "
+                        "Set them under Environment variables."
+                    )
                 project_graph = load_project_graph(app_name, project_root=ROOT)
                 ensure_all_sources_isolated([c.clone_path for c in project_graph.values()])
-                flow_path = cfg.flows_dir / flow
-                if not flow_path.is_file():
-                    alt = cfg.clone_path / Path(cfg.flows_dir.name) / flow
-                    if not alt.is_file():
-                        alt = cfg.clone_path / "flows" / flow
-                    hint = f"Expected under `{cfg.flows_dir}`"
-                    if alt != flow_path:
-                        hint += f" or `{alt}`"
-                    st.error(f"Maestro flow not found: `{flow}`. {hint}.")
-                    st.stop()
+                # Generated repro.yaml is written at intake; optional fallback flow only if no Jira.
+                if not (jira_issue or "").strip():
+                    flow_path = cfg.flows_dir / flow
+                    if not flow_path.is_file():
+                        st.error(f"Maestro flow not found: `{flow}` under `{cfg.flows_dir}`.")
+                        st.stop()
             state = create_pipeline_state(
                 app_name=app_name,
                 app_config=cfg,
@@ -867,6 +1039,7 @@ def page_run_pipeline() -> None:
                 max_attempts=int(max_attempts),
                 dry_run=dry_run,
                 project_graph=project_graph,
+                force_unbootstrapped=bool(force_unbootstrapped) if mode == "real" else False,
             )
             final, duration_sec = _run_pipeline_with_live_ui(state)
             st.session_state["result_state"] = final
@@ -1062,14 +1235,109 @@ def _render_results(final: dict) -> None:
         _kv(rca, ["target_app", "root_cause_hypothesis", "suspected_files", "confidence", "suggested_fix"])
         _kv(final.get("ticket_finding"), ["title", "body", "reason"])
     with tab_dev:
-        _kv(final.get("dev_finding"), ["target_app", "branch", "build", "tests"])
+        _kv(final.get("dev_finding"), ["target_app", "branch", "build", "tests", "committed"])
+        _kv(final.get("finalize_finding") or final.get("merge_finding"), ["branch", "commit_sha", "committed"])
         if final.get("pr_url"):
             st.markdown(f"[Merge request]({final['pr_url']})")
     with tab_qa:
         _kv(final.get("qa_finding"), ["failure_type", "description", "evidence_paths"])
+        _kv(final.get("verifier_finding"), ["passed", "issue_resolved", "comments", "confidence"])
         st.markdown(_history_table_html(final.get("execution_history") or []), unsafe_allow_html=True)
     with tab_raw:
         st.json(_jsonable(final))
+
+
+def _render_run_detail(run: dict) -> None:
+    """Shared detail view for Test results / History."""
+    st.markdown(
+        _stats_html(
+            [
+                ("Jira", html.escape(str(run.get("jira_key") or "—"))),
+                ("Run", html.escape(str(run.get("run_id") or "—"))),
+                ("Branch", html.escape(str(run.get("branch") or "—"))),
+                ("Commit", html.escape(str(run.get("commit_sha") or "—")[:12])),
+            ]
+        ),
+        unsafe_allow_html=True,
+    )
+    state_slice = run.get("state") or {}
+    verifier = run.get("_verifier") or state_slice.get("verifier_finding") or {}
+    st.markdown("**Verifier**")
+    st.write(verifier.get("comments") or "(no comments)")
+    st.caption(
+        f"issue_resolved={verifier.get('issue_resolved')} · "
+        f"confidence={verifier.get('confidence')} · "
+        f"Maestro status from retest: "
+        f"{(state_slice.get('retest_finding') or {}).get('original_defect_resolved')}"
+    )
+    after = run.get("_after_video")
+    if after and Path(after).is_file():
+        st.video(after)
+    elif state_slice.get("after_video_paths"):
+        for p in state_slice["after_video_paths"]:
+            if Path(str(p)).is_file():
+                st.video(str(p))
+                break
+    else:
+        st.info("No after-video stored for this run.")
+    with st.expander("Manifest JSON", expanded=False):
+        st.json(_jsonable(run))
+
+
+def page_test_results() -> None:
+    _section("Test results", "latest pipeline outcome + after-video verifier")
+    final = st.session_state.get("result_state")
+    if not final:
+        st.info("No in-session run yet. Trigger a pipeline from **Run pipeline**, or open **History**.")
+        return
+    finalize = final.get("finalize_finding") or final.get("merge_finding") or {}
+    verifier = final.get("verifier_finding") or {}
+    st.markdown(
+        _stats_html(
+            [
+                ("Status", _pill(final.get("status"))),
+                ("Branch", html.escape(str(finalize.get("branch") or (final.get("dev_finding") or {}).get("branch") or "—"))),
+                ("Commit", html.escape(str(finalize.get("commit_sha") or "—")[:12] or "—")),
+                ("Verifier", _pill("pass" if verifier.get("passed") else "fail/n/a", "ok" if verifier.get("passed") else "warn")),
+            ]
+        ),
+        unsafe_allow_html=True,
+    )
+    if verifier.get("comments"):
+        st.markdown("**Verifier comments**")
+        st.write(verifier["comments"])
+    retest = final.get("retest_finding") or {}
+    primary = retest.get("primary_result") or {}
+    st.caption(f"Maestro primary passed: {primary.get('passed')} · flow={primary.get('flow_name') or final.get('flow_name')}")
+    videos = _after_videos(final)
+    if videos:
+        for path in videos:
+            st.video(str(path))
+            st.caption(path.name)
+    else:
+        st.info("No after-video in the latest session result.")
+
+
+def page_history() -> None:
+    from utils.run_history import list_attempts, list_jira_keys, load_run
+
+    _section("History", "local/runs/<JIRA-KEY>/<run-id>/")
+    keys = list_jira_keys(ROOT / "local" / "runs")
+    if not keys:
+        st.info("No saved runs under `local/runs/` yet.")
+        return
+    jira_key = st.selectbox("Jira key", keys)
+    attempts = list_attempts(jira_key, ROOT / "local" / "runs")
+    if not attempts:
+        st.warning("No attempts for this key.")
+        return
+    labels = [f"{a.get('run_id')} · {a.get('saved_at', '')[:19]} · {(a.get('commit_sha') or '')[:8]}" for a in attempts]
+    choice = st.selectbox("Attempt", labels)
+    idx = labels.index(choice)
+    run_id = attempts[idx].get("run_id")
+    detail = load_run(jira_key, run_id, ROOT / "local" / "runs") if run_id else None
+    if detail:
+        _render_run_detail(detail)
 
 
 def main() -> None:
@@ -1084,7 +1352,14 @@ def main() -> None:
 
     page = st.sidebar.radio(
         "Navigation",
-        ["Run pipeline", "Projects", "Dependency graph", "Environment variables"],
+        [
+            "Run pipeline",
+            "Test results",
+            "History",
+            "Projects",
+            "Dependency graph",
+            "Environment variables",
+        ],
     )
     if page == "Environment variables":
         page_environment()
@@ -1092,6 +1367,10 @@ def main() -> None:
         page_projects()
     elif page == "Dependency graph":
         page_dependency_graph()
+    elif page == "Test results":
+        page_test_results()
+    elif page == "History":
+        page_history()
     else:
         page_run_pipeline()
 
